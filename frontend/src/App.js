@@ -5,7 +5,7 @@ import ThreeMap from './ThreeMap';
 function App() {
   const [buildings, setBuildings] = useState([]);
   useEffect(() => {
-    fetch('https://calgary-3d-dashboard-q63w.onrender.com')
+    fetch('http://localhost:5000/api/buildings')
       .then(r => r.json())
       .then(setBuildings);
   }, []);
