@@ -1,0 +1,1 @@
+User → React → Flask API → LLM + SQLite → React → Three.js
