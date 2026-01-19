@@ -1,10 +1,15 @@
 """
-Calgary Open Data fetch + normalization + joins (GeoJSON-first) — FIXED (400 error + faster joins).
+Calgary Open Data fetch + joins — FIXED (no more 400).
 
-Fixes:
-- ✅ 400 Bad Request: Socrata spatial filter must use the dataset's actual geometry column
-  (often `the_geom`, not `geometry`). This code auto-tries common names.
-- ✅ STRtree join: avoids `geoms.index(poly)` (slow / can be wrong). Uses id->props map.
+Why you keep getting 400:
+- `within_box(<field>, ...)` MUST use the dataset's real geometry column name.
+- For Calgary Socrata datasets, it is NOT always `geometry` / `shape`.
+- This version AUTO-DISCOVERS the correct geometry field via the Socrata metadata API
+  (https://data.calgary.ca/api/views/<dataset_id>) and then uses it in within_box().
+
+Also:
+- Keeps bbox-filtered requests (fast)
+- Uses STRtree joins (fast)
 """
 
 from __future__ import annotations
@@ -20,9 +25,15 @@ from shapely.strtree import STRtree
 
 
 # --- Calgary Open Data endpoints (Socrata GeoJSON) ---
-BUILDINGS_URL = "https://data.calgary.ca/resource/cchr-krqg.geojson"  # 3D Buildings
-LAND_USE_URL = "https://data.calgary.ca/resource/qe6k-p9nh.geojson"   # Land Use Districts (zoning)
-ASSESS_URL = "https://data.calgary.ca/resource/4bsw-nn7w.geojson"     # Assessment parcels
+BUILDINGS_ID = "cchr-krqg"
+LAND_USE_ID = "qe6k-p9nh"
+ASSESS_ID = "4bsw-nn7w"
+
+BUILDINGS_URL = f"https://data.calgary.ca/resource/{BUILDINGS_ID}.geojson"
+LAND_USE_URL = f"https://data.calgary.ca/resource/{LAND_USE_ID}.geojson"
+ASSESS_URL = f"https://data.calgary.ca/resource/{ASSESS_ID}.geojson"
+
+SITE_ROOT = "https://data.calgary.ca"
 
 
 DEFAULT_BBOX = {
@@ -43,10 +54,10 @@ ENABLE_ASSESS_JOIN = os.getenv("ENABLE_ASSESS_JOIN", "1") == "1"
 
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 
-# Try these geometry column names in $where. (Most Socrata datasets use `the_geom`.)
-GEOM_FIELDS_TO_TRY = tuple(
-    s.strip() for s in os.getenv("GEOM_FIELDS_TO_TRY", "the_geom,geom,location,shape").split(",") if s.strip()
-)
+# If you *already know* a dataset's geom field, you can force it via env:
+# GEOM_FIELD_cchr-krqg=the_geom   (example)
+def _forced_geom_field(dataset_id: str) -> Optional[str]:
+    return os.getenv(f"GEOM_FIELD_{dataset_id}")
 
 
 def _as_float(v: Any) -> Optional[float]:
@@ -79,6 +90,45 @@ def _extract_ring_coords(geom: Dict[str, Any]) -> Optional[List[List[float]]]:
     return None
 
 
+@lru_cache(maxsize=32)
+def _discover_geom_field(dataset_id: str) -> str:
+    """
+    Ask Socrata metadata for the dataset and pick the column that holds geometry.
+    This removes guessing (geometry/the_geom/shape/etc.) and fixes 400s.
+    """
+    forced = _forced_geom_field(dataset_id)
+    if forced:
+        return forced
+
+    meta_url = f"{SITE_ROOT}/api/views/{dataset_id}"
+    r = requests.get(meta_url, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    meta = r.json()
+
+    cols = meta.get("columns") or []
+    # Socrata: geometry columns often have dataTypeName like 'location', 'point', 'multipolygon', 'polygon', etc.
+    geom_candidates: List[str] = []
+    for c in cols:
+        dt = (c.get("dataTypeName") or "").lower()
+        fn = c.get("fieldName")
+        if not fn:
+            continue
+        if dt in {"location", "point", "polygon", "multipolygon", "line", "multiline", "multipoint"}:
+            geom_candidates.append(fn)
+
+    # Most common preferred names if present
+    preferred_order = ["the_geom", "geom", "shape", "location"]
+    for p in preferred_order:
+        if p in geom_candidates:
+            return p
+
+    if geom_candidates:
+        return geom_candidates[0]
+
+    # If metadata didn't expose it (rare), fall back to most common
+    return "the_geom"
+
+
 def _within_box_where(bbox: Dict[str, float], geom_field: str) -> str:
     # within_box(<geom_field>, north, west, south, east)
     return (
@@ -103,28 +153,10 @@ def _fetch_geojson_features(url: str, limit: int, where: Optional[str] = None) -
     return feats
 
 
-def _fetch_bbox_features(url: str, limit: int, bbox: Dict[str, float]) -> List[Dict[str, Any]]:
-    """
-    Socrata 400 usually means the geometry field name is wrong.
-    Try common geometry fields until one works.
-    """
-    last_http_err: Optional[requests.HTTPError] = None
-
-    for geom_field in GEOM_FIELDS_TO_TRY:
-        where = _within_box_where(bbox, geom_field=geom_field)
-        try:
-            return _fetch_geojson_features(url, limit, where=where)
-        except requests.HTTPError as e:
-            last_http_err = e
-            resp = getattr(e, "response", None)
-            # If it's not a 400, surface immediately (e.g., 429 rate limit, 5xx)
-            if resp is not None and resp.status_code != 400:
-                raise
-
-    # If all geom fields failed, raise the last error with context
-    if last_http_err:
-        raise last_http_err
-    raise RuntimeError("Failed to fetch bbox-filtered features (no matching geometry field).")
+def _fetch_bbox_features(url: str, dataset_id: str, limit: int, bbox: Dict[str, float]) -> List[Dict[str, Any]]:
+    geom_field = _discover_geom_field(dataset_id)
+    where = _within_box_where(bbox, geom_field=geom_field)
+    return _fetch_geojson_features(url, limit, where=where)
 
 
 def _bbox_center(bbox: Dict[str, float]) -> Tuple[float, float]:
@@ -138,7 +170,7 @@ def _bbox_center(bbox: Dict[str, float]) -> Tuple[float, float]:
 @lru_cache(maxsize=8)
 def _load_land_use_index(north: float, west: float, south: float, east: float):
     bbox = {"north": north, "west": west, "south": south, "east": east}
-    feats = _fetch_bbox_features(LAND_USE_URL, LAND_USE_FETCH_LIMIT, bbox)
+    feats = _fetch_bbox_features(LAND_USE_URL, LAND_USE_ID, LAND_USE_FETCH_LIMIT, bbox)
 
     geoms = []
     props_list = []
@@ -166,7 +198,7 @@ def _load_land_use_index(north: float, west: float, south: float, east: float):
 @lru_cache(maxsize=8)
 def _load_assess_index(north: float, west: float, south: float, east: float):
     bbox = {"north": north, "west": west, "south": south, "east": east}
-    feats = _fetch_bbox_features(ASSESS_URL, ASSESS_FETCH_LIMIT, bbox)
+    feats = _fetch_bbox_features(ASSESS_URL, ASSESS_ID, ASSESS_FETCH_LIMIT, bbox)
 
     geoms = []
     props_list = []
@@ -238,7 +270,7 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int | None = No
     bbox = bbox or DEFAULT_BBOX
     limit = int(limit or RETURN_LIMIT)
 
-    building_features = _fetch_bbox_features(BUILDINGS_URL, BUILDINGS_FETCH_LIMIT, bbox)
+    building_features = _fetch_bbox_features(BUILDINGS_URL, BUILDINGS_ID, BUILDINGS_FETCH_LIMIT, bbox)
 
     origin_x, origin_y = _bbox_center(bbox)
     buildings: List[Dict[str, Any]] = []
@@ -253,7 +285,6 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int | None = No
 
         footprint_ll = [[float(p[0]), float(p[1])] for p in ring]
 
-        # centroid
         try:
             poly = shp_shape(geom)
             c = poly.centroid
@@ -313,6 +344,7 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int | None = No
             "origin_x": origin_x,
             "origin_y": origin_y,
         },
+        "geom_field_used": _discover_geom_field(BUILDINGS_ID),
         "count": len(buildings),
         "buildings": buildings,
     }
