@@ -143,14 +143,18 @@ def parse_query(user_text: str) -> Dict[str, Any]:
     if not os.getenv("HF_API_KEY"):
         return _regex_fallback(user_text)
 
+    # Prompt intentionally mirrors the assignment spec:
+    # "Extract the filter from this query: {user_input}. Return a JSON object with
+    #  'attribute', 'operator', and 'value'."
     prompt = (
-        "You are a data extraction assistant. "
-        "Convert the user's request into ONE building filter JSON. "
-        "Return ONLY JSON (no markdown).\n\n"
-        "Allowed attributes: height, zoning, assessed_value, address.\n"
-        "Allowed operators: >, <, ==, contains.\n\n"
-        f"User query: {user_text}\n\n"
-        "Return JSON like: {\"attribute\":\"height\",\"operator\":\">\",\"value\":100}"
+        "Extract the filter from this query: "
+        f"{user_text}\n\n"
+        "Return a JSON object with:\n"
+        "- attribute (e.g., height, zoning, assessed_value, address)\n"
+        "- operator (one of: >, <, ==, contains)\n"
+        "- value (number or string)\n\n"
+        "Return ONLY JSON (no markdown).\n"
+        "Example: {\"attribute\":\"height\",\"operator\":\">\",\"value\":100}"
     )
 
     try:
@@ -177,6 +181,20 @@ def parse_query(user_text: str) -> Dict[str, Any]:
         if not f:
             return _regex_fallback(user_text)
 
-        return _normalize_filter(f)
+        normalized = _normalize_filter(f)
+
+        # Unit handling: if the user explicitly asked for feet/ft and the filter is height,
+        # convert to meters (dataset heights are treated as meters across the app).
+        try:
+            if normalized.get("attribute") == "height":
+                t = user_text.lower()
+                if " feet" in t or "foot" in t or " ft" in t or t.endswith("ft"):
+                    v = normalized.get("value")
+                    if isinstance(v, (int, float)):
+                        normalized["value"] = float(v) * 0.3048
+        except Exception:
+            pass
+
+        return normalized
     except Exception:
         return _regex_fallback(user_text)

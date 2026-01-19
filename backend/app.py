@@ -100,6 +100,57 @@ def query():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/nl_query", methods=["POST"])
+def nl_query():
+    """End-to-end NL query -> LLM filter -> backend filtering.
+
+    This endpoint matches the assignment flow:
+      1) user types an NL query
+      2) Flask calls Hugging Face (via parse_query)
+      3) backend applies the filter(s) to the dataset
+      4) returns matched ids for Three.js highlighting
+
+    Body:
+      {
+        "query": "highlight buildings over 100 feet",
+        "existing_filters": [{attribute,operator,value}, ...]   // optional
+      }
+
+    Response:
+      {
+        "filter": {attribute,operator,value},
+        "filters": [...],
+        "matched_ids": [...],
+        "count": N
+      }
+    """
+    try:
+        body = request.get_json(force=True)
+        user_query = (body.get("query") or "").strip()
+        if not user_query:
+            return jsonify({"error": "Missing 'query'"}), 400
+
+        existing = body.get("existing_filters") or []
+        if not isinstance(existing, list):
+            return jsonify({"error": "existing_filters must be a list"}), 400
+
+        new_filter = parse_query(user_query)
+        all_filters = [*existing, new_filter]
+
+        payload = fetch_buildings()
+        buildings = payload.get("buildings", [])
+
+        matched = []
+        for b in buildings:
+            if all(_apply_single_filter(b, f) for f in all_filters):
+                matched.append(b.get("id"))
+
+        return jsonify({"filter": new_filter, "filters": all_filters, "matched_ids": matched, "count": len(matched)})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/save", methods=["POST"])
 def save():
     try:
