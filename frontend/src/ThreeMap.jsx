@@ -7,22 +7,31 @@ function safeLabel(v) {
   return String(v);
 }
 
+// lon/lat degrees -> Web Mercator meters (EPSG:3857)
+function lonLatToMercatorMeters(lon, lat) {
+  const R = 6378137;
+  const x = R * (lon * Math.PI / 180);
+  const y = R * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 360)));
+  return [x, y];
+}
+
 export default function ThreeMap({ buildings, matchedIds }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
   const meshesRef = useRef([]);
   const [selected, setSelected] = useState(null);
 
-  const HEIGHT_SCALE = 2.5;
-  const MIN_HEIGHT = 10;
+  // tune these
+  const HEIGHT_SCALE = 1.0; // now that coords are meters, start at 1.0
+  const MIN_HEIGHT = 8;     // meters
 
   const mats = useMemo(() => {
     return {
-      base: new THREE.MeshStandardMaterial({ color: 0x9aa0a6, roughness: 0.75, metalness: 0.05 }),
-      match: new THREE.MeshStandardMaterial({ color: 0xd93025, roughness: 0.65, metalness: 0.05 }),
-      selected: new THREE.MeshStandardMaterial({ color: 0x1a73e8, roughness: 0.55, metalness: 0.08 }),
-      ground: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, metalness: 0.0 }),
-      edge: new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.18 }),
+      base: new THREE.MeshStandardMaterial({ color: 0xa3a7ad, roughness: 0.85, metalness: 0.02 }),
+      match: new THREE.MeshStandardMaterial({ color: 0xd93025, roughness: 0.75, metalness: 0.02 }),
+      selected: new THREE.MeshStandardMaterial({ color: 0x1a73e8, roughness: 0.65, metalness: 0.05 }),
+      ground: new THREE.MeshStandardMaterial({ color: 0xf3f3f3, roughness: 1.0, metalness: 0.0 }),
+      edge: new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.16 }),
     };
   }, []);
 
@@ -35,7 +44,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
     if (pts.length >= 2) {
       const a = pts[0];
       const b = pts[pts.length - 1];
-      if (a.distanceTo(b) < 0.0001) pts = pts.slice(0, -1);
+      if (a.distanceTo(b) < 0.01) pts = pts.slice(0, -1); // meters now, so 0.01m is safe
     }
     if (pts.length < 3) return null;
 
@@ -64,76 +73,131 @@ export default function ThreeMap({ buildings, matchedIds }) {
     const height = mountRef.current.clientHeight;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xf7f7f7);
+    scene.background = new THREE.Color(0xeceff1);
+    scene.fog = new THREE.Fog(0xeceff1, 1500, 9000);
 
     const camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 200000);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(width, height);
     renderer.setPixelRatio(window.devicePixelRatio || 1);
+
+    // ✅ better “map” look
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05;
+
+    // ✅ shadows
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
     mountRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // lights
-    scene.add(new THREE.AmbientLight(0xffffff, 0.9));
-    const dir = new THREE.DirectionalLight(0xffffff, 0.85);
-    dir.position.set(400, -500, 800);
-    scene.add(dir);
+    // lights (more directional, less flat)
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+    const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+    sun.position.set(1200, -900, 1800);
+    sun.castShadow = true;
+    sun.shadow.mapSize.width = 2048;
+    sun.shadow.mapSize.height = 2048;
+    sun.shadow.camera.near = 1;
+    sun.shadow.camera.far = 8000;
+    sun.shadow.camera.left = -3000;
+    sun.shadow.camera.right = 3000;
+    sun.shadow.camera.top = 3000;
+    sun.shadow.camera.bottom = -3000;
+    scene.add(sun);
+
+    // subtle fill to avoid harsh contrast
+    const fill = new THREE.DirectionalLight(0xffffff, 0.25);
+    fill.position.set(-900, 1200, 900);
+    scene.add(fill);
 
     // controls
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.07;
+    controls.screenSpacePanning = false;
+    controls.maxPolarAngle = Math.PI / 2.05; // don’t go under ground
+    controls.minDistance = 80;
+    controls.maxDistance = 12000;
 
     const group = new THREE.Group();
     scene.add(group);
 
-    // ground
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(2500, 2500), mats.ground);
-    ground.rotation.x = -Math.PI / 2;
-    ground.position.set(0, 0, 0);
-    scene.add(ground);
+    // ----- Convert buildings to meters + choose a consistent origin -----
+    // Use bbox center from your data if available, otherwise center of first building.
+    let originMx = 0;
+    let originMy = 0;
 
-    // build meshes
-    buildings.forEach((b) => {
-      const pts = b.footprint_xy;
-      if (!Array.isArray(pts) || pts.length < 3) return;
+    const first = buildings?.find((b) => Array.isArray(b?.footprint_ll) && b.footprint_ll.length > 2);
+    if (first) {
+      const [lon0, lat0] = first.footprint_ll[0];
+      [originMx, originMy] = lonLatToMercatorMeters(Number(lon0), Number(lat0));
+    }
 
-      const shape = makeShape(pts);
+    // Build meshes
+    buildings.forEach((b, i) => {
+      const ll = b.footprint_ll; // ✅ use lon/lat from API
+      if (!Array.isArray(ll) || ll.length < 3) return;
+
+      const ptsMeters = ll.map(([lon, lat]) => {
+        const [mx, my] = lonLatToMercatorMeters(Number(lon), Number(lat));
+        return [mx - originMx, my - originMy];
+      });
+
+      const shape = makeShape(ptsMeters);
       if (!shape) return;
 
       const rawH = Number(b.height) || 10;
       const h = Math.max(MIN_HEIGHT, rawH * HEIGHT_SCALE);
 
-      // IMPORTANT: extrude goes up +Z by default. Do NOT rotate it.
-      const geo = new THREE.ExtrudeGeometry(shape, { depth: h, bevelEnabled: false });
+      // Extrude in +Z, then rotate so Z is up and polygon sits on ground plane.
+      const geo = new THREE.ExtrudeGeometry(shape, {
+        depth: h,
+        bevelEnabled: false,
+        curveSegments: 2,
+        steps: 1,
+      });
       geo.computeVertexNormals();
 
       const mesh = new THREE.Mesh(geo, mats.base);
       mesh.userData = { building: b };
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
 
-      // outline (visual polish)
+      // outline
       const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), mats.edge);
-      edges.raycast = () => null; // ✅ prevent edges from stealing clicks
+      edges.raycast = () => null;
       mesh.add(edges);
 
       group.add(mesh);
       meshesRef.current.push(mesh);
     });
 
-    // fit camera
+    // Ground sized to content
     const box = new THREE.Box3().setFromObject(group);
     const size = new THREE.Vector3();
     const center = new THREE.Vector3();
     box.getSize(size);
     box.getCenter(center);
 
+    const groundSize = Math.max(size.x, size.y) * 1.6 || 2500;
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), mats.ground);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.set(center.x, center.y, 0);
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // Fit camera
     const maxDim = Math.max(size.x, size.y, size.z) || 400;
     controls.target.copy(center);
 
     camera.near = 0.1;
-    camera.far = maxDim * 30 + 5000;
-    camera.position.set(center.x + maxDim * 0.5, center.y - maxDim * 1.35, center.z + maxDim * 0.9);
+    camera.far = maxDim * 40 + 10000;
+    camera.position.set(center.x + maxDim * 0.9, center.y - maxDim * 1.4, center.z + maxDim * 0.8);
     camera.updateProjectionMatrix();
 
     // selection/highlight
@@ -156,8 +220,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
       mouse.y = -(((ev.clientY - rect.top) / rect.height) * 2 - 1);
 
       raycaster.setFromCamera(mouse, camera);
-
-      // intersect only building meshes (not children)
       const hits = raycaster.intersectObjects(meshesRef.current, false);
 
       if (hits.length > 0) {
@@ -192,7 +254,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
     };
     animate();
 
-    // init
     applyMaterials(null);
 
     return () => {
