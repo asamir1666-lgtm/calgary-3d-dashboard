@@ -4,7 +4,22 @@ import ThreeMap from "./ThreeMap.jsx";
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
 
 function prettyFilter(f) {
+  if (!f) return "";
   return `${f.attribute} ${f.operator} ${f.value}`;
+}
+
+// Normalize projects response: can be [] or {projects: []}
+function normalizeProjectsResponse(j) {
+  if (Array.isArray(j)) return j;
+  if (j && Array.isArray(j.projects)) return j.projects;
+  return [];
+}
+
+// Normalize project name key differences
+function getProjectName(p) {
+  if (!p) return "";
+  if (typeof p === "string") return p;
+  return p.name || p.project_name || p.title || "";
 }
 
 export default function App() {
@@ -16,33 +31,51 @@ export default function App() {
   const [username, setUsername] = useState("ali");
   const [projectName, setProjectName] = useState("");
   const [projects, setProjects] = useState([]);
+
   const [nlQuery, setNlQuery] = useState("");
   const [filters, setFilters] = useState([]);
-  const [filtersHistory, setFiltersHistory] = useState([]);
+
+  // ✅ history stores BOTH filters + matched ids so "Back" truly restores the view
+  const [history, setHistory] = useState([]);
+
   const [matchedIds, setMatchedIds] = useState(new Set());
+
+  // prevents double-applying when we already have matched_ids from server
   const skipNextApplyRef = useRef(false);
 
-  function pushHistory(snapshot) {
-    setFiltersHistory((h) => {
+  const buildings = payload?.buildings || [];
+
+  // ---------- HISTORY ----------
+  function pushHistorySnapshot(snapshot) {
+    // snapshot = { filters: [...], matched_ids: [...] }
+    setHistory((h) => {
       const next = [...h, snapshot];
-      // keep it bounded so it doesn't grow forever
-      return next.slice(-20);
+      return next.slice(-30);
+    });
+  }
+
+  function pushCurrentToHistory() {
+    pushHistorySnapshot({
+      filters: Array.isArray(filters) ? JSON.parse(JSON.stringify(filters)) : [],
+      matched_ids: Array.from(matchedIds || []),
     });
   }
 
   function goBack() {
-    setFiltersHistory((h) => {
+    setHistory((h) => {
       if (h.length === 0) return h;
       const prev = h[h.length - 1];
-      skipNextApplyRef.current = false;
-      setFilters(prev);
-      applyFilters(prev);
+
+      // restore filters + highlights immediately
+      skipNextApplyRef.current = true;
+      setFilters(prev.filters || []);
+      setMatchedIds(new Set(prev.matched_ids || []));
+
       return h.slice(0, -1);
     });
   }
 
-  const buildings = payload?.buildings || [];
-
+  // ---------- DATA ----------
   async function loadBuildings() {
     setLoading(true);
     setError("");
@@ -58,19 +91,22 @@ export default function App() {
     }
   }
 
+  // ---------- PROJECTS ----------
   async function refreshProjects(user = username) {
     if (!user) return;
     try {
       const r = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(user)}`);
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "Failed to fetch projects");
-      setProjects(j);
+
+      setProjects(normalizeProjectsResponse(j));
     } catch (e) {
-      // keep UI usable; don’t hard-fail
       console.warn(e);
+      // keep UI usable; don’t hard-fail
     }
   }
 
+  // ---------- APPLY FILTERS (compute highlights) ----------
   async function applyFilters(nextFilters) {
     try {
       const r = await fetch(`${API_BASE}/api/apply_filters`, {
@@ -94,6 +130,7 @@ export default function App() {
     refreshProjects(username);
   }, [username]);
 
+  // When filters change, compute highlights (unless we already got matched_ids from server)
   useEffect(() => {
     if (skipNextApplyRef.current) {
       skipNextApplyRef.current = false;
@@ -102,26 +139,33 @@ export default function App() {
     applyFilters(filters);
   }, [filters]);
 
+  // ---------- LLM QUERY ----------
   async function runLLMQuery() {
     const q = nlQuery.trim();
     if (!q) return;
+
     setError("");
     try {
-      // Save previous state so the user can undo / go back.
-      pushHistory(filters);
+      // save snapshot so Back works
+      pushCurrentToHistory();
 
-      // Use the end-to-end endpoint so the flow is:
-      // NL query -> HF extraction -> backend filtering -> Three.js highlight.
       const r = await fetch(`${API_BASE}/api/nl_query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: q, existing_filters: filters }),
       });
+
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "LLM query failed");
 
-      // server returns: { filter, filters, matched_ids, count }
-      const nextFilters = Array.isArray(j.filters) ? j.filters : [...filters, j.filter];
+      // server may return: {filter, filters, matched_ids, count}
+      const nextFilters = Array.isArray(j.filters)
+        ? j.filters
+        : j.filter
+        ? [...filters, j.filter]
+        : filters;
+
+      // We already have matched_ids from backend -> skip apply_filters
       skipNextApplyRef.current = true;
       setFilters(nextFilters);
       setMatchedIds(new Set(j.matched_ids || []));
@@ -131,21 +175,36 @@ export default function App() {
     }
   }
 
+  // ---------- SAVE PROJECT ----------
   async function saveProject() {
     const name = projectName.trim();
     const user = username.trim();
+
     if (!user) return setError("Enter a username first.");
     if (!name) return setError("Enter a project name.");
+    if (!filters.length) return setError("Run a query first so there are filters to save.");
 
     setError("");
     try {
+      // ✅ Optional: push history so you can Back after save if you change things
+      pushCurrentToHistory();
+
+      // Save filters (backend should compute highlights on load)
       const r = await fetch(`${API_BASE}/api/save`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: user, name, filters }),
+        body: JSON.stringify({
+          username: user,
+          name,
+          filters,
+          // Extra: some backends may choose to store this too
+          matched_ids: Array.from(matchedIds || []),
+        }),
       });
+
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "Save failed");
+
       setProjectName("");
       await refreshProjects(user);
     } catch (e) {
@@ -153,36 +212,48 @@ export default function App() {
     }
   }
 
+  // ---------- LOAD PROJECT ----------
   async function loadProject(p) {
     const user = username.trim();
     if (!user) return setError("Enter a username first.");
 
-    // Save current state so the user can go back.
-    pushHistory(filters);
+    const name = getProjectName(p);
+    if (!name) return setError("This saved project is missing a name.");
 
+    // Save current snapshot so Back works
+    pushCurrentToHistory();
+
+    setError("");
     try {
-      // Use a dedicated backend endpoint that returns BOTH:
-      // - the saved filters
-      // - the matching building ids (so the 3D highlight updates immediately)
       const r = await fetch(`${API_BASE}/api/load`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: user, name: p?.name }),
+        body: JSON.stringify({ username: user, name }),
       });
+
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "Load failed");
 
-      const loaded = Array.isArray(j.filters) ? j.filters : [];
-      skipNextApplyRef.current = true; // we already have matched_ids
-      setFilters(loaded);
-      setMatchedIds(new Set(j.matched_ids || []));
+      const loadedFilters = Array.isArray(j.filters) ? j.filters : [];
+
+      // If backend returns matched_ids, use them immediately.
+      if (Array.isArray(j.matched_ids)) {
+        skipNextApplyRef.current = true;
+        setFilters(loadedFilters);
+        setMatchedIds(new Set(j.matched_ids));
+      } else {
+        // ✅ Fallback: backend didn't return matched_ids -> compute highlights now.
+        skipNextApplyRef.current = true;
+        setFilters(loadedFilters);
+        await applyFilters(loadedFilters);
+      }
     } catch (e) {
       setError(String(e.message || e));
     }
   }
 
   function removeFilter(idx) {
-    pushHistory(filters);
+    pushCurrentToHistory();
     setFilters((prev) => prev.filter((_, i) => i !== idx));
   }
 
@@ -213,7 +284,14 @@ export default function App() {
 
         {ui.loading && <div>Loading buildings…</div>}
         {ui.error && (
-          <div style={{ background: "#fff3f3", border: "1px solid #ffd0d0", padding: 10, borderRadius: 8 }}>
+          <div
+            style={{
+              background: "#fff3f3",
+              border: "1px solid #ffd0d0",
+              padding: 10,
+              borderRadius: 8,
+            }}
+          >
             <b>Error:</b> {ui.error}
           </div>
         )}
@@ -227,6 +305,9 @@ export default function App() {
             onChange={(e) => setNlQuery(e.target.value)}
             placeholder='e.g. "highlight buildings over 30"'
             style={{ flex: 1, padding: 10, borderRadius: 8, border: "1px solid #ddd" }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") runLLMQuery();
+            }}
           />
           <button
             onClick={runLLMQuery}
@@ -266,7 +347,8 @@ export default function App() {
                 </button>
               </div>
             ))}
-            {filtersHistory.length > 0 && (
+
+            {history.length > 0 && (
               <button
                 onClick={goBack}
                 style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
@@ -274,10 +356,12 @@ export default function App() {
                 Back
               </button>
             )}
+
             <button
               onClick={() => {
-                pushHistory(filters);
+                pushCurrentToHistory();
                 setFilters([]);
+                setMatchedIds(new Set());
               }}
               style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
             >
@@ -317,26 +401,31 @@ export default function App() {
           <div style={{ fontSize: 13, color: "#777" }}>No saved projects for this user.</div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {projects.map((p, idx) => (
-              <button
-                key={idx}
-                onClick={() => loadProject(p)}
-                style={{
-                  textAlign: "left",
-                  padding: 10,
-                  borderRadius: 8,
-                  border: "1px solid #eee",
-                  cursor: "pointer",
-                  background: "white",
-                }}
-                title="Load project"
-              >
-                <b>{p.name}</b>
-                <div style={{ fontSize: 12, color: "#666" }}>
-                  {Array.isArray(p.filters) ? p.filters.map(prettyFilter).join(" | ") : "(invalid filters)"}
-                </div>
-              </button>
-            ))}
+            {projects.map((p, idx) => {
+              const name = getProjectName(p) || `Project ${idx + 1}`;
+              const savedFilters = Array.isArray(p?.filters) ? p.filters : null;
+
+              return (
+                <button
+                  key={`${name}-${idx}`}
+                  onClick={() => loadProject(p)}
+                  style={{
+                    textAlign: "left",
+                    padding: 10,
+                    borderRadius: 8,
+                    border: "1px solid #eee",
+                    cursor: "pointer",
+                    background: "white",
+                  }}
+                  title="Load project"
+                >
+                  <b>{name}</b>
+                  <div style={{ fontSize: 12, color: "#666" }}>
+                    {savedFilters ? savedFilters.map(prettyFilter).join(" | ") : "Saved analysis"}
+                  </div>
+                </button>
+              );
+            })}
           </div>
         )}
 
