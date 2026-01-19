@@ -25,7 +25,60 @@ def health():
 @app.route("/api/buildings")
 def buildings():
     try:
+        # Returns {bbox, projection, count, buildings:[...]}
         return jsonify(fetch_buildings())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _apply_single_filter(b: dict, f: dict) -> bool:
+    attr = f.get("attribute")
+    op = f.get("operator")
+    val = f.get("value")
+
+    # Prefer normalized top-level fields, fallback to raw properties
+    if attr in b:
+        bv = b.get(attr)
+    else:
+        bv = (b.get("properties") or {}).get(attr)
+
+    if bv is None:
+        return False
+
+    try:
+        if op in (">", "<"):
+            return (float(bv) > float(val)) if op == ">" else (float(bv) < float(val))
+        if op == "contains":
+            return str(val).lower() in str(bv).lower()
+        # ==
+        return str(bv).lower() == str(val).lower()
+    except Exception:
+        return False
+
+
+@app.route("/api/apply_filters", methods=["POST"])
+def apply_filters():
+    """Backend-side filtering: returns matching building ids.
+
+    Body:
+      {"filters": [{attribute,operator,value}, ...]}
+    Response:
+      {"matched_ids": [..], "count": N}
+    """
+    try:
+        body = request.get_json(force=True)
+        filters = body.get("filters") or []
+        if not isinstance(filters, list):
+            return jsonify({"error": "filters must be a list"}), 400
+
+        payload = fetch_buildings()
+        buildings = payload.get("buildings", [])
+
+        matched = []
+        for b in buildings:
+            if all(_apply_single_filter(b, f) for f in filters):
+                matched.append(b.get("id"))
+        return jsonify({"matched_ids": matched, "count": len(matched)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
