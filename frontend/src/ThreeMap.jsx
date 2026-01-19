@@ -16,23 +16,95 @@ function lonLatToMercatorMeters(lon, lat) {
   return [x, y];
 }
 
+// ✅ Simple pitched roof (triangle look) placed on top of a building.
+// footprintPts: Array<[x,y]> meters (same coordinate system as extrusions)
+// height: building height
+function makePitchedRoof(footprintPts, height, roofMat) {
+  if (!Array.isArray(footprintPts) || footprintPts.length < 3) return null;
+
+  // centroid
+  let cx = 0,
+    cy = 0;
+  for (const [x, y] of footprintPts) {
+    cx += x;
+    cy += y;
+  }
+  cx /= footprintPts.length;
+  cy /= footprintPts.length;
+
+  // bbox
+  let minX = Infinity,
+    maxX = -Infinity,
+    minY = Infinity,
+    maxY = -Infinity;
+  for (const [x, y] of footprintPts) {
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  }
+
+  const dx = maxX - minX;
+  const dy = maxY - minY;
+
+  // if tiny building footprint, skip roof
+  if (!isFinite(dx) || !isFinite(dy) || dx < 4 || dy < 4) return null;
+
+  // roof dimensions
+  const roofLen = Math.max(dx, dy);
+  const roofWid = Math.min(dx, dy);
+
+  // roof rise based on height
+  const rise = Math.max(2.5, Math.min(14, height * 0.2));
+
+  // Make a triangle profile, extrude it
+  const tri = new THREE.Shape();
+  tri.moveTo(-roofLen / 2, 0);
+  tri.lineTo(roofLen / 2, 0);
+  tri.lineTo(0, rise);
+  tri.closePath();
+
+  const geo = new THREE.ExtrudeGeometry(tri, {
+    depth: roofWid,
+    bevelEnabled: false,
+    steps: 1,
+    curveSegments: 1,
+  });
+  geo.computeVertexNormals();
+
+  const roof = new THREE.Mesh(geo, roofMat);
+  roof.castShadow = true;
+  roof.receiveShadow = true;
+
+  // Put it on top
+  roof.position.set(cx, cy, height + 0.15);
+
+  // ExtrudeGeometry extrudes along +Z for depth; rotate so depth becomes Y
+  roof.rotation.x = Math.PI / 2;
+
+  // Align roof along long axis
+  if (dx < dy) roof.rotation.z = Math.PI / 2;
+
+  // Center the depth
+  roof.position.y -= roofWid / 2;
+
+  return roof;
+}
+
 export default function ThreeMap({ buildings, matchedIds }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
   const meshesRef = useRef([]);
 
-  // Allow selecting multiple buildings (Shift+Click to add/remove).
-  // The info panel shows the last clicked building.
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [selectedInfo, setSelectedInfo] = useState(null);
 
   // ✅ Map-look tuning
-  // If buildings feel too flat, bump HEIGHT_SCALE up (2.2–3.0).
   const HEIGHT_SCALE = 2.2;
   const MIN_HEIGHT = 12;
 
   const mats = useMemo(() => {
-    // Procedural "window" texture so extruded polygons read as actual buildings.
+    // Procedural "window" texture
     const makeFacadeTexture = () => {
       const canvas = document.createElement("canvas");
       canvas.width = 256;
@@ -40,18 +112,15 @@ export default function ThreeMap({ buildings, matchedIds }) {
       const ctx = canvas.getContext("2d");
       if (!ctx) return null;
 
-      // base facade
       ctx.fillStyle = "#7b7f86";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      // subtle vertical variation
       for (let x = 0; x < canvas.width; x += 8) {
         const t = (x / canvas.width) * 0.12;
         ctx.fillStyle = `rgba(255,255,255,${t})`;
         ctx.fillRect(x, 0, 1, canvas.height);
       }
 
-      // windows grid
       const padX = 18;
       const padY = 18;
       const winW = 14;
@@ -69,7 +138,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
         }
       }
 
-      // horizontal bands
       ctx.fillStyle = "rgba(0,0,0,0.08)";
       for (let y = 0; y < canvas.height; y += 64) {
         ctx.fillRect(0, y, canvas.width, 2);
@@ -87,7 +155,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
 
     const facadeTex = makeFacadeTexture();
 
-    // Wall + roof separation
     const wallBase = new THREE.MeshStandardMaterial({
       map: facadeTex || null,
       color: 0x9aa0a6,
@@ -98,12 +165,11 @@ export default function ThreeMap({ buildings, matchedIds }) {
     });
 
     const roofBase = new THREE.MeshStandardMaterial({
-      color: 0x7c828a, // slightly brighter roof so it reads clearly
+      color: 0x7c828a,
       roughness: 0.95,
       metalness: 0.02,
     });
 
-    // Match tint
     const wallMatch = wallBase.clone();
     wallMatch.color = new THREE.Color(0xd93025);
     wallMatch.emissive = new THREE.Color(0x6b1a16);
@@ -112,7 +178,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
     const roofMatch = roofBase.clone();
     roofMatch.color = new THREE.Color(0xb3261e);
 
-    // Selected tint
     const wallSelected = wallBase.clone();
     wallSelected.color = new THREE.Color(0x1a73e8);
     wallSelected.emissive = new THREE.Color(0x0b2a66);
@@ -122,11 +187,15 @@ export default function ThreeMap({ buildings, matchedIds }) {
     roofSelected.color = new THREE.Color(0x1558b0);
 
     return {
-      // ExtrudeGeometry groups: [front, back, sides]
-      // front/back = caps (roof surfaces), sides = walls
       base: [roofBase, roofBase, wallBase],
       match: [roofMatch, roofMatch, wallMatch],
       selected: [roofSelected, roofSelected, wallSelected],
+
+      // ✅ for pitched roofs: reuse roofBase etc
+      roofBase,
+      roofMatch,
+      roofSelected,
+
       ground: new THREE.MeshStandardMaterial({
         color: 0xf2f2f2,
         roughness: 1.0,
@@ -145,7 +214,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
 
     let pts = pointsXY.map(([x, y]) => new THREE.Vector2(Number(x), Number(y)));
 
-    // Drop duplicate last point if same as first
     if (pts.length >= 2) {
       const a = pts[0];
       const b = pts[pts.length - 1];
@@ -153,7 +221,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
     }
     if (pts.length < 3) return null;
 
-    // Ensure CCW winding
     if (THREE.ShapeUtils.isClockWise(pts)) pts.reverse();
 
     const shape = new THREE.Shape();
@@ -188,16 +255,13 @@ export default function ThreeMap({ buildings, matchedIds }) {
     renderer.setSize(width, height);
     renderer.setPixelRatio(window.devicePixelRatio || 1);
 
-    // ✅ better “map” look
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.05;
 
-    // ✅ shadows
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-    // ✅ environment lighting for more realistic materials
     const pmrem = new THREE.PMREMGenerator(renderer);
     scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
@@ -205,7 +269,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
     mountRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // lights
     scene.add(new THREE.AmbientLight(0xffffff, 0.35));
 
     const sun = new THREE.DirectionalLight(0xffffff, 1.0);
@@ -225,7 +288,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
     fill.position.set(-900, 1200, 900);
     scene.add(fill);
 
-    // controls
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.07;
@@ -237,7 +299,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
     const group = new THREE.Group();
     scene.add(group);
 
-    // ----- Convert buildings to meters + choose a consistent origin -----
+    // ----- origin -----
     let originMx = 0;
     let originMy = 0;
 
@@ -249,7 +311,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
       [originMx, originMy] = lonLatToMercatorMeters(Number(lon0), Number(lat0));
     }
 
-    // Build meshes
+    // Build meshes (3D model map style)
     buildings.forEach((b) => {
       const ll = b.footprint_ll;
       if (!Array.isArray(ll) || ll.length < 3) return;
@@ -262,21 +324,22 @@ export default function ThreeMap({ buildings, matchedIds }) {
       const shape = makeShape(ptsMeters);
       if (!shape) return;
 
+      // ✅ vary height slightly so it looks like a real map model
       const rawH = Number(b.height) || 10;
-      const h = Math.max(MIN_HEIGHT, rawH * HEIGHT_SCALE);
+      const jitter = 0.85 + Math.random() * 0.55; // 0.85..1.40
+      const h = Math.max(MIN_HEIGHT, rawH * HEIGHT_SCALE * jitter);
 
+      // main "box" building
       const geo = new THREE.ExtrudeGeometry(shape, {
         depth: h,
         bevelEnabled: false,
-        curveSegments: 2,
+        curveSegments: 1,
         steps: 1,
       });
       geo.computeVertexNormals();
 
       const mesh = new THREE.Mesh(geo, mats.base);
       mesh.userData = { building: b };
-
-      // ✅ Make it read like a city: shadows + sit on ground
       mesh.position.z = 0;
       mesh.castShadow = true;
       mesh.receiveShadow = true;
@@ -288,6 +351,12 @@ export default function ThreeMap({ buildings, matchedIds }) {
 
       group.add(mesh);
       meshesRef.current.push(mesh);
+
+      // ✅ add pitched roof to some buildings
+      if (Math.random() < 0.35) {
+        const roof = makePitchedRoof(ptsMeters, h, mats.roofBase);
+        if (roof) group.add(roof);
+      }
     });
 
     // Ground sized to content
@@ -297,8 +366,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
     box.getSize(size);
     box.getCenter(center);
 
-    // ✅ Bigger ground so it feels like a "map"
-    const groundSize = Math.max(size.x, size.y) * 1.8 || 3000;
+    const groundSize = Math.max(size.x, size.y) * 2.2 || 3500;
 
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(groundSize, groundSize),
@@ -309,31 +377,32 @@ export default function ThreeMap({ buildings, matchedIds }) {
     ground.receiveShadow = true;
     scene.add(ground);
 
-    // ✅ Single subtle grid (data-sized)
-    const gridHelper = new THREE.GridHelper(groundSize, 100, 0x000000, 0x000000);
+    // single subtle grid
+    const gridHelper = new THREE.GridHelper(groundSize, 110, 0x000000, 0x000000);
     gridHelper.position.set(center.x, center.y, 0.01);
-
     if (Array.isArray(gridHelper.material)) {
       gridHelper.material.forEach((m) => {
         m.transparent = true;
-        m.opacity = 0.05;
+        m.opacity = 0.08;
       });
     } else {
       gridHelper.material.transparent = true;
-      gridHelper.material.opacity = 0.05;
+      gridHelper.material.opacity = 0.08;
     }
     scene.add(gridHelper);
 
-    // Fit camera (more “map-like” tilted angle)
+    // Fit camera
     const maxDim = Math.max(size.x, size.y, size.z) || 400;
     controls.target.copy(center);
 
     camera.near = 0.1;
-    camera.far = maxDim * 50 + 12000;
+    camera.far = maxDim * 60 + 16000;
+
+    // more "map model" angle (slightly higher + tilted)
     camera.position.set(
-      center.x + maxDim * 1.2,
-      center.y - maxDim * 1.6,
-      center.z + maxDim * 1.1
+      center.x + maxDim * 1.3,
+      center.y - maxDim * 1.75,
+      center.z + maxDim * 1.25
     );
     camera.updateProjectionMatrix();
 
