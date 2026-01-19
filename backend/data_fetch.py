@@ -31,8 +31,8 @@ DEFAULT_BBOX = {
 
 
 def _first_geom(record: Dict[str, Any]) -> Dict[str, Any] | None:
-    """Socrata datasets vary: some use 'geom', others 'the_geom'."""
-    return record.get("geom") or record.get("the_geom")
+    """Socrata datasets vary: some use 'the_geom', others 'geom'."""
+    return record.get("the_geom") or record.get("geom")
 
 
 def _as_float(v: Any) -> float | None:
@@ -67,12 +67,10 @@ def _extract_ring_coords(geom: Dict[str, Any]) -> List[List[float]] | None:
     if not coords:
         return None
 
-    # Polygon: [ [ [lon,lat], ... ] , [hole], ... ]
     if gtype == "Polygon":
         if isinstance(coords, list) and len(coords) > 0 and isinstance(coords[0], list):
             return coords[0]
 
-    # MultiPolygon: [ [ [ [lon,lat]... ] ], [poly2], ... ]
     if gtype == "MultiPolygon":
         try:
             return coords[0][0]
@@ -82,19 +80,46 @@ def _extract_ring_coords(geom: Dict[str, Any]) -> List[List[float]] | None:
     return None
 
 
+def _fetch_raw(bbox: Dict[str, float], limit: int) -> List[Dict[str, Any]]:
+    """
+    Socrata within_box signature:
+      within_box(geometry, north, west, south, east)
+    Also, geometry field might be 'the_geom' or 'geom'.
+    """
+    north = bbox["north"]
+    west = bbox["west"]
+    south = bbox["south"]
+    east = bbox["east"]
+
+    # Try likely geometry field names
+    for geom_field in ("the_geom", "geom"):
+        params = {
+            "$limit": limit,
+            "$where": f"within_box({geom_field},{north},{west},{south},{east})",
+        }
+        r = requests.get(SOCRATA_URL, params=params, timeout=30)
+
+        # If this geom_field is wrong, Socrata often returns 400
+        if r.status_code == 400:
+            continue
+
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+
+    # If both fail, raise a clear error
+    raise RuntimeError(
+        "Calgary Socrata request failed (within_box). "
+        "Likely geometry field differs or bbox invalid."
+    )
+
+
 def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> Dict[str, Any]:
     """Fetch and return normalized buildings + projection metadata."""
     bbox = bbox or DEFAULT_BBOX
 
-    params = {
-        "$limit": limit,
-        "$where": (
-            f"within_box(geom,{bbox['south']},{bbox['west']},{bbox['north']},{bbox['east']})"
-        ),
-    }
-    r = requests.get(SOCRATA_URL, params=params, timeout=30)
-    r.raise_for_status()
-    raw = r.json()
+    raw = _fetch_raw(bbox, limit)
 
     # Compute reference center for projection
     lat0 = (bbox["south"] + bbox["north"]) / 2.0
@@ -107,7 +132,6 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> D
         if not ring or len(ring) < 3:
             continue
 
-        # Normalize height: accept several possible field names
         height = (
             _as_float(rec.get("height"))
             or _as_float(rec.get("bldg_height"))
@@ -116,7 +140,6 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> D
             or 10.0
         )
 
-        # Normalize zoning/value/address best-effort
         zoning = rec.get("zoning") or rec.get("land_use") or rec.get("zone")
         address = rec.get("address") or rec.get("street_address") or rec.get("full_address")
         assessed_value = (
