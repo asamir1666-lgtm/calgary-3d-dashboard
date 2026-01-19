@@ -24,7 +24,7 @@ function getProjectName(p) {
 
 // normalize ids into Numbers (fixes string/number mismatch)
 function normalizeIdSet(arr) {
-  return new Set((arr || []).map((x) => (x === null || x === undefined ? x : Number(x))));
+  return new Set((arr || []).map((x) => (x === null || x === undefined ? x : String(x))));
 }
 
 function normalizeIdArray(arr) {
@@ -216,21 +216,22 @@ export default function App() {
 
   // ---------- MULTI-SELECT BUILDINGS ----------
   function toggleSelectBuilding(id) {
-    if (id === null || id === undefined) return;
+  if (id === null || id === undefined) return;
 
-    pushCurrentToHistory();
-    setActiveProjectName("");
+  pushCurrentToHistory();
+  setActiveProjectName("");
 
-    setSelectedBuildingIds((prev) => {
-      const next = new Set(prev);
-      const n = Number(id);
-      if (next.has(n)) next.delete(n);
-      else next.add(n);
-      return next;
-    });
+  setSelectedBuildingIds((prev) => {
+    const next = new Set(prev);
+    const key = String(id);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    return next;
+  });
 
-    setMapKey((k) => k + 1);
-  }
+  setMapKey((k) => k + 1);
+}
+
 
   function clearSelectedBuildings() {
     pushCurrentToHistory();
@@ -266,13 +267,10 @@ export default function App() {
           filters,
           matched_ids: Array.from(matchedIds || []),
 
-          // ✅ NEW multi-select
-          selected_building_ids: selectedArr,
+        
+          selected_building_ids: Array.from(selectedBuildingIds || []).map(String),
+          selected_building_id: Array.from(selectedBuildingIds || []).map(String).slice(-1)[0] ?? null,
 
-          // ✅ keep old single field for backward compatibility
-          selected_building_id: selectedArr.length ? selectedArr[selectedArr.length - 1] : null,
-        }),
-      });
 
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "Save failed");
