@@ -29,6 +29,9 @@ DEFAULT_BBOX = {
     "east": float(os.getenv("BBOX_E", "-114.065")),
 }
 
+# If Socrata rejects within_box, we fetch a bigger batch and filter locally
+FALLBACK_LIMIT = int(os.getenv("FALLBACK_LIMIT", "5000"))
+
 
 def _first_geom(record: Dict[str, Any]) -> Dict[str, Any] | None:
     """Socrata datasets vary: some use 'the_geom', others 'geom'."""
@@ -80,18 +83,35 @@ def _extract_ring_coords(geom: Dict[str, Any]) -> List[List[float]] | None:
     return None
 
 
+def _ring_intersects_bbox(ring: List[List[float]], bbox: Dict[str, float]) -> bool:
+    """Fast bbox overlap test using ring lon/lat extents."""
+    lons = [p[0] for p in ring]
+    lats = [p[1] for p in ring]
+    if not lons or not lats:
+        return False
+
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+
+    return not (
+        max_lon < bbox["west"]
+        or min_lon > bbox["east"]
+        or max_lat < bbox["south"]
+        or min_lat > bbox["north"]
+    )
+
+
 def _fetch_raw(bbox: Dict[str, float], limit: int) -> List[Dict[str, Any]]:
     """
-    Socrata within_box signature:
-      within_box(geometry, north, west, south, east)
-    Also, geometry field might be 'the_geom' or 'geom'.
+    Try Socrata server-side within_box first.
+    If Socrata returns 400 (common on some assets), fallback to client-side filtering.
     """
     north = bbox["north"]
     west = bbox["west"]
     south = bbox["south"]
     east = bbox["east"]
 
-    # Try likely geometry field names
+    # 1) Try within_box with common geometry fields
     for geom_field in ("the_geom", "geom"):
         params = {
             "$limit": limit,
@@ -99,20 +119,41 @@ def _fetch_raw(bbox: Dict[str, float], limit: int) -> List[Dict[str, Any]]:
         }
         r = requests.get(SOCRATA_URL, params=params, timeout=30)
 
-        # If this geom_field is wrong, Socrata often returns 400
+        # If this geom_field/where is rejected, try next
         if r.status_code == 400:
             continue
 
         r.raise_for_status()
         data = r.json()
-        if isinstance(data, list):
+        if isinstance(data, list) and len(data) > 0:
             return data
 
-    # If both fail, raise a clear error
-    raise RuntimeError(
-        "Calgary Socrata request failed (within_box). "
-        "Likely geometry field differs or bbox invalid."
-    )
+    # 2) Fallback: fetch a larger batch and filter locally by bbox
+    # (Still satisfies "from public API" — we just filter in Python.)
+    r = requests.get(SOCRATA_URL, params={"$limit": FALLBACK_LIMIT}, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected Socrata response shape (expected list).")
+
+    filtered: List[Dict[str, Any]] = []
+    for rec in data:
+        geom = _first_geom(rec)
+        ring = _extract_ring_coords(geom) if geom else None
+        if not ring:
+            continue
+        if _ring_intersects_bbox(ring, bbox):
+            filtered.append(rec)
+        if len(filtered) >= limit:
+            break
+
+    if not filtered:
+        raise RuntimeError(
+            "Fallback fetch returned 0 buildings in bbox. "
+            "Try adjusting BBOX_N/E/S/W env vars."
+        )
+
+    return filtered
 
 
 def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> Dict[str, Any]:
