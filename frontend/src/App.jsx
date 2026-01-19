@@ -1,6 +1,6 @@
 
 import React, { useEffect, useState } from 'react';
-import ThreeMap from './ThreeMap';
+import ThreeMap from './ThreeMap.jsx';
 
 function App() {
   const [buildings, setBuildings] = useState([]);
