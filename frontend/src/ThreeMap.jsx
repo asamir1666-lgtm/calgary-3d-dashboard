@@ -9,39 +9,31 @@ function safeLabel(v) {
 
 export default function ThreeMap({ buildings, matchedIds }) {
   const mountRef = useRef(null);
-
-  const sceneRef = useRef(null);
   const rendererRef = useRef(null);
-  const cameraRef = useRef(null);
-  const controlsRef = useRef(null);
-
   const meshesRef = useRef([]);
-  const groupRef = useRef(null);
-
   const [selected, setSelected] = useState(null); // {building, x, y}
 
-  // ---------- Visual tuning ----------
-  const HEIGHT_SCALE = 2.2; // makes buildings pop (1.5–4 looks good)
-  const MIN_HEIGHT = 8;     // prevents “flat/line” buildings
-  const XY_SCALE = 1;       // footprint_xy should already be meters; keep 1
+  // Visual tuning
+  const HEIGHT_SCALE = 2.5;
+  const MIN_HEIGHT = 10;
 
-  // Stable materials (don’t recreate every render)
   const mats = useMemo(() => {
     return {
       base: new THREE.MeshStandardMaterial({ color: 0x9aa0a6, roughness: 0.75, metalness: 0.05 }),
       match: new THREE.MeshStandardMaterial({ color: 0xd93025, roughness: 0.65, metalness: 0.05 }),
       selected: new THREE.MeshStandardMaterial({ color: 0x1a73e8, roughness: 0.55, metalness: 0.08 }),
       ground: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, metalness: 0.0 }),
+      edge: new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.18 }),
     };
   }, []);
 
-  function makeShapeFromFootprintXY(footprintXY) {
-    if (!Array.isArray(footprintXY) || footprintXY.length < 3) return null;
+  function makeShape(pointsXY) {
+    if (!Array.isArray(pointsXY) || pointsXY.length < 3) return null;
 
-    // Convert to Vector2
-    let pts = footprintXY.map(([x, y]) => new THREE.Vector2(x * XY_SCALE, y * XY_SCALE));
+    // Build Vector2 list
+    let pts = pointsXY.map(([x, y]) => new THREE.Vector2(Number(x), Number(y)));
 
-    // Remove last point if it repeats the first (common in GeoJSON rings)
+    // Drop duplicate last point if same as first
     if (pts.length >= 2) {
       const a = pts[0];
       const b = pts[pts.length - 1];
@@ -49,18 +41,16 @@ export default function ThreeMap({ buildings, matchedIds }) {
     }
     if (pts.length < 3) return null;
 
-    // Fix winding order (Three wants CCW for correct faces)
+    // Ensure CCW winding
     if (THREE.ShapeUtils.isClockWise(pts)) pts.reverse();
 
     const shape = new THREE.Shape();
     shape.moveTo(pts[0].x, pts[0].y);
     for (let i = 1; i < pts.length; i++) shape.lineTo(pts[i].x, pts[i].y);
     shape.closePath();
-
     return shape;
   }
 
-  // Build / rebuild scene when building dataset changes
   useEffect(() => {
     if (!mountRef.current) return;
 
@@ -87,11 +77,12 @@ export default function ThreeMap({ buildings, matchedIds }) {
     renderer.setSize(width, height);
     renderer.setPixelRatio(window.devicePixelRatio || 1);
     mountRef.current.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
 
     // Lights
-    scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+    scene.add(new THREE.AmbientLight(0xffffff, 0.9));
     const dir = new THREE.DirectionalLight(0xffffff, 0.85);
-    dir.position.set(300, -400, 700);
+    dir.position.set(400, -500, 800);
     scene.add(dir);
 
     // Controls
@@ -99,31 +90,12 @@ export default function ThreeMap({ buildings, matchedIds }) {
     controls.enableDamping = true;
     controls.dampingFactor = 0.07;
 
-    // Group all buildings so we can fit camera to it
+    // Group
     const group = new THREE.Group();
     scene.add(group);
-    groupRef.current = group;
 
-    // Compute dataset center (so everything is near origin)
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-
-    buildings.forEach((b) => {
-      const pts = b.footprint_xy;
-      if (!Array.isArray(pts) || pts.length < 3) return;
-      for (const [x, y] of pts) {
-        if (x < minX) minX = x;
-        if (y < minY) minY = y;
-        if (x > maxX) maxX = x;
-        if (y > maxY) maxY = y;
-      }
-    });
-
-    const centerX = Number.isFinite(minX) ? (minX + maxX) / 2 : 0;
-    const centerY = Number.isFinite(minY) ? (minY + maxY) / 2 : 0;
-
-    // Ground (centered under buildings)
-    const groundSize = 2500;
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), mats.ground);
+    // Ground
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(2500, 2500), mats.ground);
     ground.rotation.x = -Math.PI / 2;
     ground.position.set(0, 0, 0);
     scene.add(ground);
@@ -133,59 +105,84 @@ export default function ThreeMap({ buildings, matchedIds }) {
       const pts = b.footprint_xy;
       if (!Array.isArray(pts) || pts.length < 3) return;
 
-      // Center to origin for stable camera/controls
-      const centered = pts.map(([x, y]) => [x - centerX, y - centerY]);
-
-      const shape = makeShapeFromFootprintXY(centered);
+      const shape = makeShape(pts);
       if (!shape) return;
 
       const rawH = Number(b.height) || 10;
       const h = Math.max(MIN_HEIGHT, rawH * HEIGHT_SCALE);
 
+      // ✅ IMPORTANT: don’t rotate extrude geometry.
+      // Extrude depth is along +Z by default, which matches our “up”.
       const geo = new THREE.ExtrudeGeometry(shape, {
         depth: h,
         bevelEnabled: false,
       });
-
-      // Put extrusion up on Z axis (so “height” is vertical)
-      geo.rotateX(Math.PI / 2);
       geo.computeVertexNormals();
 
       const mesh = new THREE.Mesh(geo, mats.base);
       mesh.userData = { building: b };
+
+      // Nicer outline so shapes look “solid”
+      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), mats.edge);
+      mesh.add(edges);
+
       group.add(mesh);
       meshesRef.current.push(mesh);
     });
 
-    // Fit camera to buildings (THIS fixes the “lines” look)
+    // Fit camera to group
     const box = new THREE.Box3().setFromObject(group);
     const size = new THREE.Vector3();
-    box.getSize(size);
     const center = new THREE.Vector3();
+    box.getSize(size);
     box.getCenter(center);
 
-    const maxDim = Math.max(size.x, size.y, size.z);
+    const maxDim = Math.max(size.x, size.y, size.z) || 400;
     controls.target.copy(center);
 
     camera.near = 0.1;
-    camera.far = maxDim * 20 + 5000;
-    camera.position.set(center.x, center.y - maxDim * 1.25, center.z + maxDim * 0.85);
+    camera.far = maxDim * 30 + 5000;
+    camera.position.set(center.x + maxDim * 0.5, center.y - maxDim * 1.35, center.z + maxDim * 0.9);
     camera.updateProjectionMatrix();
 
-    // Store refs
-    sceneRef.current = scene;
-    rendererRef.current = renderer;
-    cameraRef.current = camera;
-    controlsRef.current = controls;
-
-    // Render loop
-    let raf = 0;
-    const animate = () => {
-      raf = requestAnimationFrame(animate);
-      controls.update();
-      renderer.render(scene, camera);
+    // Highlight helper
+    const applyMaterials = (selectedId) => {
+      meshesRef.current.forEach((m) => {
+        const bid = m.userData.building?.id;
+        const isMatch = matchedIds?.has?.(bid);
+        const isSel = selectedId && bid === selectedId;
+        m.material = isSel ? mats.selected : isMatch ? mats.match : mats.base;
+      });
     };
-    animate();
+
+    // Click interaction
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const handleClick = (ev) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -(((ev.clientY - rect.top) / rect.height) * 2 - 1);
+
+      raycaster.setFromCamera(mouse, camera);
+
+      // ✅ Use recursive=true so edge children don’t block selection
+      const hits = raycaster.intersectObjects(meshesRef.current, true);
+
+      // Find first hit that belongs to a building mesh
+      const hit = hits.find((h) => h.object?.userData?.building) || hits.find((h) => h.object?.parent?.userData?.building);
+
+      if (hit) {
+        const building = hit.object.userData.building || hit.object.parent.userData.building;
+        applyMaterials(building.id);
+        setSelected({ building, x: ev.clientX - rect.left + 8, y: ev.clientY - rect.top + 8 });
+      } else {
+        applyMaterials(null);
+        setSelected(null);
+      }
+    };
+
+    renderer.domElement.addEventListener("click", handleClick);
 
     // Resize
     const handleResize = () => {
@@ -198,40 +195,16 @@ export default function ThreeMap({ buildings, matchedIds }) {
     };
     window.addEventListener("resize", handleResize);
 
-    // Click interaction
-    const raycaster = new THREE.Raycaster();
-    const mouse = new THREE.Vector2();
-
-    const applyMaterials = (selectedId) => {
-      meshesRef.current.forEach((m) => {
-        const b = m.userData.building;
-        const isMatch = matchedIds?.has?.(b.id);
-        const isSel = selectedId && b.id === selectedId;
-        m.material = isSel ? mats.selected : isMatch ? mats.match : mats.base;
-      });
+    // Loop
+    let raf = 0;
+    const animate = () => {
+      raf = requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
     };
+    animate();
 
-    const handleClick = (ev) => {
-      const rect = renderer.domElement.getBoundingClientRect();
-      mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-      mouse.y = -(((ev.clientY - rect.top) / rect.height) * 2 - 1);
-
-      raycaster.setFromCamera(mouse, camera);
-      const hits = raycaster.intersectObjects(meshesRef.current, false);
-
-      if (hits.length > 0) {
-        const b = hits[0].object.userData.building;
-        applyMaterials(b.id);
-        setSelected({ building: b, x: ev.clientX - rect.left + 8, y: ev.clientY - rect.top + 8 });
-      } else {
-        applyMaterials(null);
-        setSelected(null);
-      }
-    };
-
-    renderer.domElement.addEventListener("click", handleClick);
-
-    // initial material state
+    // Initial highlight state
     applyMaterials(selected?.building?.id || null);
 
     return () => {
@@ -246,9 +219,9 @@ export default function ThreeMap({ buildings, matchedIds }) {
   // Update highlights when matchedIds changes
   useEffect(() => {
     meshesRef.current.forEach((m) => {
-      const b = m.userData.building;
-      const isSelected = selected?.building?.id === b.id;
-      const isMatch = matchedIds?.has?.(b.id);
+      const bid = m.userData.building?.id;
+      const isSelected = selected?.building?.id === bid;
+      const isMatch = matchedIds?.has?.(bid);
       m.material = isSelected ? mats.selected : isMatch ? mats.match : mats.base;
     });
   }, [matchedIds, selected, mats]);
@@ -257,7 +230,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
     <div style={{ position: "absolute", inset: 0 }}>
       <div ref={mountRef} style={{ position: "absolute", inset: 0 }} />
 
-      {/* Popup */}
       {selected && (
         <div
           style={{
@@ -276,18 +248,10 @@ export default function ThreeMap({ buildings, matchedIds }) {
           }}
         >
           <div style={{ fontWeight: 800, marginBottom: 8 }}>Building</div>
-          <div style={{ marginBottom: 6 }}>
-            <b>Address:</b> {safeLabel(selected.building.address)}
-          </div>
-          <div style={{ marginBottom: 6 }}>
-            <b>Height:</b> {safeLabel(selected.building.height)}
-          </div>
-          <div style={{ marginBottom: 6 }}>
-            <b>Zoning:</b> {safeLabel(selected.building.zoning)}
-          </div>
-          <div style={{ marginBottom: 10 }}>
-            <b>Assessed Value:</b> {safeLabel(selected.building.assessed_value)}
-          </div>
+          <div style={{ marginBottom: 6 }}><b>Address:</b> {safeLabel(selected.building.address)}</div>
+          <div style={{ marginBottom: 6 }}><b>Height:</b> {safeLabel(selected.building.height)}</div>
+          <div style={{ marginBottom: 6 }}><b>Zoning:</b> {safeLabel(selected.building.zoning)}</div>
+          <div style={{ marginBottom: 10 }}><b>Assessed Value:</b> {safeLabel(selected.building.assessed_value)}</div>
 
           <div style={{ fontWeight: 800, marginBottom: 6 }}>Raw data</div>
           <div
