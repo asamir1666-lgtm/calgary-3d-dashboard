@@ -11,7 +11,7 @@ function safeLabel(v) {
 // lon/lat degrees -> Web Mercator meters (EPSG:3857)
 function lonLatToMercatorMeters(lon, lat) {
   const R = 6378137;
-  const x = R * (lon * Math.PI) / 180;
+  const x = (R * (lon * Math.PI)) / 180;
   const y = R * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
   return [x, y];
 }
@@ -47,7 +47,8 @@ export default function ThreeMap({ buildings, matchedIds }) {
       // subtle vertical variation
       for (let x = 0; x < canvas.width; x += 8) {
         const t = (x / canvas.width) * 0.12;
-        ctx.fillStyle = rgba(255,255,255,${t});
+        // ✅ FIXED: must be a string (template literal)
+        ctx.fillStyle = `rgba(255,255,255,${t})`;
         ctx.fillRect(x, 0, 1, canvas.height);
       }
 
@@ -276,12 +277,10 @@ export default function ThreeMap({ buildings, matchedIds }) {
       const mesh = new THREE.Mesh(geo, mats.base);
       mesh.userData = { building: b };
 
-      // ✅ Make it read like a city: shadows + sit on ground
       mesh.position.z = 0;
       mesh.castShadow = true;
       mesh.receiveShadow = true;
 
-      // outline
       const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), mats.edge);
       edges.raycast = () => null;
       mesh.add(edges);
@@ -297,7 +296,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
     box.getSize(size);
     box.getCenter(center);
 
-    // ✅ Bigger ground so it feels like a "map"
     const groundSize = Math.max(size.x, size.y) * 1.8 || 3000;
 
     const ground = new THREE.Mesh(
@@ -309,7 +307,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
     ground.receiveShadow = true;
     scene.add(ground);
 
-    // ✅ Single subtle grid (data-sized)
     const gridHelper = new THREE.GridHelper(groundSize, 100, 0x000000, 0x000000);
     gridHelper.position.set(center.x, center.y, 0.01);
 
@@ -324,7 +321,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
     }
     scene.add(gridHelper);
 
-    // Fit camera (more “map-like” tilted angle)
+    // Fit camera
     const maxDim = Math.max(size.x, size.y, size.z) || 400;
     controls.target.copy(center);
 
