@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import ThreeMap from "./ThreeMap.jsx";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
@@ -19,6 +19,7 @@ export default function App() {
   const [nlQuery, setNlQuery] = useState("");
   const [filters, setFilters] = useState([]);
   const [matchedIds, setMatchedIds] = useState(new Set());
+  const skipNextApplyRef = useRef(false);
 
   const buildings = payload?.buildings || [];
 
@@ -74,6 +75,10 @@ export default function App() {
   }, [username]);
 
   useEffect(() => {
+    if (skipNextApplyRef.current) {
+      skipNextApplyRef.current = false;
+      return;
+    }
     applyFilters(filters);
   }, [filters]);
 
@@ -82,16 +87,21 @@ export default function App() {
     if (!q) return;
     setError("");
     try {
-      const r = await fetch(`${API_BASE}/api/query`, {
+      // Use the end-to-end endpoint so the flow is:
+      // NL query -> HF extraction -> backend filtering -> Three.js highlight.
+      const r = await fetch(`${API_BASE}/api/nl_query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q }),
+        body: JSON.stringify({ query: q, existing_filters: filters }),
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "LLM query failed");
 
-      const f = j;
-      setFilters((prev) => [...prev, f]);
+      // server returns: { filter, filters, matched_ids, count }
+      const nextFilters = Array.isArray(j.filters) ? j.filters : [...filters, j.filter];
+      skipNextApplyRef.current = true;
+      setFilters(nextFilters);
+      setMatchedIds(new Set(j.matched_ids || []));
       setNlQuery("");
     } catch (e) {
       setError(String(e.message || e));
