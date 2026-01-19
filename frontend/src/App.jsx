@@ -22,9 +22,15 @@ function getProjectName(p) {
   return p.name || p.project_name || p.title || "";
 }
 
-// ✅ normalize ids into Numbers (fixes string/number mismatch)
+// normalize ids into Numbers (fixes string/number mismatch)
 function normalizeIdSet(arr) {
   return new Set((arr || []).map((x) => (x === null || x === undefined ? x : Number(x))));
+}
+
+function normalizeIdArray(arr) {
+  return (arr || [])
+    .filter((x) => x !== null && x !== undefined)
+    .map((x) => Number(x));
 }
 
 export default function App() {
@@ -37,20 +43,27 @@ export default function App() {
   const [projectName, setProjectName] = useState("");
   const [projects, setProjects] = useState([]);
 
-  const [activeProjectName, setActiveProjectName] = useState(""); // shows active
+  const [activeProjectName, setActiveProjectName] = useState("");
 
   const [nlQuery, setNlQuery] = useState("");
   const [filters, setFilters] = useState([]);
 
-  // ✅ history stores filters + matched ids + selected building
+  // history stores filters + matched ids + selected buildings
   const [history, setHistory] = useState([]);
 
   const [matchedIds, setMatchedIds] = useState(new Set());
 
-  // ✅ store selected building
-  const [selectedBuildingId, setSelectedBuildingId] = useState(null);
+  // ✅ MULTI SELECT (Set of ids)
+  const [selectedBuildingIds, setSelectedBuildingIds] = useState(new Set());
 
-  // ✅ force map remount to refresh view
+  // ✅ keep single for backward compatibility (optional)
+  const selectedBuildingId = useMemo(() => {
+    // last selected id (for any parts still using single)
+    const arr = Array.from(selectedBuildingIds);
+    return arr.length ? arr[arr.length - 1] : null;
+  }, [selectedBuildingIds]);
+
+  // force map remount to refresh view
   const [mapKey, setMapKey] = useState(0);
 
   // prevents double-applying when we already have matched_ids from server
@@ -70,7 +83,7 @@ export default function App() {
     pushHistorySnapshot({
       filters: Array.isArray(filters) ? JSON.parse(JSON.stringify(filters)) : [],
       matched_ids: Array.from(matchedIds || []),
-      selected_building_id: selectedBuildingId,
+      selected_building_ids: Array.from(selectedBuildingIds || []),
       active_project_name: activeProjectName,
     });
   }
@@ -83,7 +96,7 @@ export default function App() {
       skipNextApplyRef.current = true;
       setFilters(prev.filters || []);
       setMatchedIds(normalizeIdSet(prev.matched_ids || []));
-      setSelectedBuildingId(prev.selected_building_id ?? null);
+      setSelectedBuildingIds(normalizeIdSet(prev.selected_building_ids || []));
       setActiveProjectName(prev.active_project_name || "");
 
       setMapKey((k) => k + 1);
@@ -131,8 +144,6 @@ export default function App() {
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "Failed to apply filters");
-
-      // ✅ normalize id types so Set matches building.id
       setMatchedIds(normalizeIdSet(j.matched_ids || []));
     } catch (e) {
       console.warn(e);
@@ -148,7 +159,7 @@ export default function App() {
 
     // changing username should reset active project + selection
     setActiveProjectName("");
-    setSelectedBuildingId(null);
+    setSelectedBuildingIds(new Set());
     setFilters([]);
     setMatchedIds(new Set());
     setHistory([]);
@@ -189,7 +200,6 @@ export default function App() {
         ? [...filters, j.filter]
         : filters;
 
-      // backend may return matched_ids
       skipNextApplyRef.current = true;
       setFilters(nextFilters);
       setMatchedIds(normalizeIdSet(j.matched_ids || []));
@@ -204,6 +214,31 @@ export default function App() {
     }
   }
 
+  // ---------- MULTI-SELECT BUILDINGS ----------
+  function toggleSelectBuilding(id) {
+    if (id === null || id === undefined) return;
+
+    pushCurrentToHistory();
+    setActiveProjectName("");
+
+    setSelectedBuildingIds((prev) => {
+      const next = new Set(prev);
+      const n = Number(id);
+      if (next.has(n)) next.delete(n);
+      else next.add(n);
+      return next;
+    });
+
+    setMapKey((k) => k + 1);
+  }
+
+  function clearSelectedBuildings() {
+    pushCurrentToHistory();
+    setSelectedBuildingIds(new Set());
+    setActiveProjectName("");
+    setMapKey((k) => k + 1);
+  }
+
   // ---------- SAVE PROJECT ----------
   async function saveProject() {
     const name = projectName.trim();
@@ -212,8 +247,10 @@ export default function App() {
     if (!user) return setError("Enter a username first.");
     if (!name) return setError("Enter a project name.");
 
-    if (!filters.length && !selectedBuildingId) {
-      return setError("Add filters or select a building before saving.");
+    const selectedArr = Array.from(selectedBuildingIds || []);
+
+    if (!filters.length && selectedArr.length === 0) {
+      return setError("Add filters or select buildings before saving.");
     }
 
     setError("");
@@ -228,7 +265,12 @@ export default function App() {
           name,
           filters,
           matched_ids: Array.from(matchedIds || []),
-          selected_building_id: selectedBuildingId,
+
+          // ✅ NEW multi-select
+          selected_building_ids: selectedArr,
+
+          // ✅ keep old single field for backward compatibility
+          selected_building_id: selectedArr.length ? selectedArr[selectedArr.length - 1] : null,
         }),
       });
 
@@ -238,7 +280,6 @@ export default function App() {
       setProjectName("");
       await refreshProjects(user);
 
-      // ✅ set active + refresh map so it clearly "locked in"
       setActiveProjectName(name);
       setMapKey((k) => k + 1);
     } catch (e) {
@@ -270,15 +311,22 @@ export default function App() {
       const loadedFilters = Array.isArray(j.filters) ? j.filters : [];
 
       setActiveProjectName(name);
-      setSelectedBuildingId(j.selected_building_id ?? null);
+
+      // ✅ NEW: load multi-select if present, else fallback to single
+      const loadedSelected =
+        Array.isArray(j.selected_building_ids)
+          ? normalizeIdSet(j.selected_building_ids)
+          : j.selected_building_id !== null && j.selected_building_id !== undefined
+          ? new Set([Number(j.selected_building_id)])
+          : new Set();
+
+      setSelectedBuildingIds(loadedSelected);
 
       if (Array.isArray(j.matched_ids)) {
-        // ✅ trust backend matched ids (normalize types)
         skipNextApplyRef.current = true;
         setFilters(loadedFilters);
         setMatchedIds(normalizeIdSet(j.matched_ids));
       } else {
-        // fallback: compute highlights from filters
         skipNextApplyRef.current = true;
         setFilters(loadedFilters);
         await applyFilters(loadedFilters);
@@ -302,22 +350,9 @@ export default function App() {
       error,
       count: payload?.count || 0,
       matched: matchedIds.size,
+      selected: selectedBuildingIds.size,
     };
-  }, [loading, error, payload, matchedIds]);
-
-  // ✅ NEW: handle selecting a building consistently
-  function handleSelectBuilding(id) {
-    // Save state so user can hit "Back"
-    pushCurrentToHistory();
-
-    setSelectedBuildingId(id);
-
-    // Selecting a building is a “new action”, so exit project lock
-    setActiveProjectName("");
-
-    // If you want selection to not wipe filters, keep as-is (we keep filters)
-    setMapKey((k) => k + 1);
-  }
+  }, [loading, error, payload, matchedIds, selectedBuildingIds]);
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "380px 1fr", height: "100vh" }}>
@@ -334,6 +369,8 @@ export default function App() {
 
         <div style={{ fontSize: 13, color: "#555", marginBottom: 12 }}>
           Buildings loaded: <b>{ui.count}</b> &nbsp; | &nbsp; Highlighted: <b>{ui.matched}</b>
+          <br />
+          Selected buildings: <b>{ui.selected}</b>
         </div>
 
         {activeProjectName ? (
@@ -428,13 +465,37 @@ export default function App() {
                 pushCurrentToHistory();
                 setFilters([]);
                 setMatchedIds(new Set());
-                setSelectedBuildingId(null);
+                setSelectedBuildingIds(new Set());
                 setActiveProjectName("");
                 setMapKey((k) => k + 1);
               }}
               style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
             >
               Clear All
+            </button>
+          </div>
+        )}
+
+        <hr style={{ margin: "16px 0" }} />
+
+        <h3 style={{ margin: "0 0 8px 0" }}>Selected Buildings</h3>
+        {ui.selected === 0 ? (
+          <div style={{ fontSize: 13, color: "#777" }}>Click buildings on the map to select (multi-select).</div>
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            <div style={{ fontSize: 13, color: "#555" }}>
+              Selected IDs:{" "}
+              <span style={{ fontFamily: "monospace" }}>
+                {Array.from(selectedBuildingIds).slice(0, 50).join(", ")}
+                {ui.selected > 50 ? " ..." : ""}
+              </span>
+            </div>
+
+            <button
+              onClick={clearSelectedBuildings}
+              style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+            >
+              Clear Selected
             </button>
           </div>
         )}
@@ -476,6 +537,14 @@ export default function App() {
               const savedFilters = Array.isArray(p?.filters) ? p.filters : null;
               const isActive = name === activeProjectName;
 
+              // show a hint if backend returns this in the list
+              const selectedCount =
+                Array.isArray(p?.selected_building_ids)
+                  ? p.selected_building_ids.length
+                  : p?.selected_building_id
+                  ? 1
+                  : 0;
+
               return (
                 <button
                   key={`${name}-${idx}`}
@@ -492,7 +561,8 @@ export default function App() {
                 >
                   <b>{name}</b>
                   <div style={{ fontSize: 12, color: "#666" }}>
-                    {savedFilters ? savedFilters.map(prettyFilter).join(" | ") : "Saved analysis"}
+                    {selectedCount ? `${selectedCount} selected building(s)` : "No selected buildings"}{" "}
+                    {savedFilters ? `• ${savedFilters.map(prettyFilter).join(" | ")}` : ""}
                   </div>
                 </button>
               );
@@ -514,14 +584,14 @@ export default function App() {
 
       {/* 3D View */}
       <div style={{ position: "relative" }}>
-       <ThreeMap
-  key={mapKey}
-  buildings={buildings}
-  matchedIds={matchedIds}
-  selectedBuildingId={selectedBuildingId}
-  onSelectBuilding={handleSelectBuilding}
-/>
-
+        <ThreeMap
+          key={mapKey}
+          buildings={buildings}
+          matchedIds={matchedIds}
+          selectedBuildingIds={selectedBuildingIds}   // ✅ NEW (multi-select)
+          selectedBuildingId={selectedBuildingId}     // optional compatibility
+          onSelectBuilding={toggleSelectBuilding}     // ✅ now toggles
+        />
       </div>
     </div>
   );
