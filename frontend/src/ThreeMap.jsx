@@ -245,15 +245,18 @@ export default function ThreeMap({
   }
 
   // ✅ apply materials based on matchedIds + selectedBuildingIds
-  const applyMaterials = (selSet) => {
-    const s = selSet || new Set();
-    meshesRef.current.forEach((m) => {
-      const bid = Number(m.userData.building?.id);
-      const isMatch = matchedIds?.has?.(bid);
-      const isSel = s?.has?.(bid);
-      m.material = isSel ? mats.selected : isMatch ? mats.match : mats.base;
-    });
-  };
+ const applyMaterials = (selSet) => {
+  const s = selSet || new Set();
+  meshesRef.current.forEach((m) => {
+    const bidRaw = m.userData.building?.id;
+    const bid = bidRaw === null || bidRaw === undefined ? null : String(bidRaw);
+
+    const isMatch = bid != null && matchedIds?.has?.(bid);
+    const isSel = bid != null && s?.has?.(bid);
+
+    m.material = isSel ? mats.selected : isMatch ? mats.match : mats.base;
+  });
+};
 
   // build scene once when buildings change
   useEffect(() => {
@@ -422,9 +425,9 @@ export default function ThreeMap({
       if (hits.length > 0) {
         const building = hits[0].object.userData.building;
         const bid = building?.id;
-
-        // ✅ delegate toggle to App (source of truth)
-        onSelectBuilding?.(bid);
+if (bid !== null && bid !== undefined) {
+  onSelectBuilding?.(String(bid));
+}
 
         // tooltip follows click
         setSelectedInfo({
@@ -472,19 +475,17 @@ export default function ThreeMap({
 
   // ✅ When selection changes in App, update materials without rebuilding the scene
   useEffect(() => {
-    applyMaterials(selectedBuildingIds);
+  applyMaterials(selectedBuildingIds);
 
-    // also support old single selectedBuildingId if someone uses it
-    // (if selectedBuildingIds is empty but selectedBuildingId exists, show it selected)
-    if (
-      (!selectedBuildingIds || selectedBuildingIds.size === 0) &&
-      selectedBuildingId !== null &&
-      selectedBuildingId !== undefined
-    ) {
-      applyMaterials(new Set([Number(selectedBuildingId)]));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedBuildingIds, selectedBuildingId, matchedIds, mats]);
+  if (
+    (!selectedBuildingIds || selectedBuildingIds.size === 0) &&
+    selectedBuildingId !== null &&
+    selectedBuildingId !== undefined
+  ) {
+    applyMaterials(new Set([String(selectedBuildingId)]));
+  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [selectedBuildingIds, selectedBuildingId, matchedIds, mats]);
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
