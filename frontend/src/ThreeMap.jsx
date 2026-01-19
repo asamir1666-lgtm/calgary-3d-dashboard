@@ -18,7 +18,8 @@ function lonLatToMercatorMeters(lon, lat) {
 }
 
 function centroidXY(pts) {
-  let cx = 0, cy = 0;
+  let cx = 0,
+    cy = 0;
   for (const [x, y] of pts) {
     cx += x;
     cy += y;
@@ -27,7 +28,7 @@ function centroidXY(pts) {
 }
 
 // shrink polygon toward centroid (space between buildings)
-function insetPolygon(points, factor = 0.90) {
+function insetPolygon(points, factor = 0.9) {
   const [cx, cy] = centroidXY(points);
   return points.map(([x, y]) => [cx + (x - cx) * factor, cy + (y - cy) * factor]);
 }
@@ -50,7 +51,7 @@ function makeGroundTexture() {
     const x = (0.08 + Math.random() * 0.78) * canvas.width;
     const y = (0.08 + Math.random() * 0.78) * canvas.height;
     const w = (0.12 + Math.random() * 0.25) * canvas.width;
-    const h = (0.10 + Math.random() * 0.20) * canvas.height;
+    const h = (0.1 + Math.random() * 0.2) * canvas.height;
     ctx.fillRect(x, y, w, h);
   }
 
@@ -71,7 +72,7 @@ function makeGroundTexture() {
     canvas.width * 0.65,
     canvas.height * 0.36,
     canvas.width * 0.35,
-    canvas.height * 0.20,
+    canvas.height * 0.2,
     0,
     canvas.height * 0.28
   );
@@ -146,19 +147,27 @@ function makeGroundTexture() {
 export default function ThreeMap({
   buildings,
   matchedIds,
+
+  // ✅ NEW: multi-select set from App
+  selectedBuildingIds = new Set(),
+
+  // keep for compatibility if other code passes it (optional)
   selectedBuildingId = null,
+
+  // ✅ App will pass toggleSelectBuilding(id)
   onSelectBuilding = null,
 }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
   const meshesRef = useRef([]);
+  const groupRef = useRef(null);
 
-  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  // local tooltip state only (selection state lives in App)
   const [selectedInfo, setSelectedInfo] = useState(null);
 
   const HEIGHT_SCALE = 2.8;
   const MIN_HEIGHT = 9;
-  const SPACING_FACTOR = 0.90;
+  const SPACING_FACTOR = 0.9;
 
   const mats = useMemo(() => {
     const wallBase = new THREE.MeshStandardMaterial({
@@ -190,12 +199,12 @@ export default function ThreeMap({
 
     const wallSelected = new THREE.MeshStandardMaterial({
       color: 0x1a73e8,
-      roughness: 0.90,
+      roughness: 0.9,
       metalness: 0.0,
     });
     const roofSelected = new THREE.MeshStandardMaterial({
       color: 0x1558b0,
-      roughness: 0.90,
+      roughness: 0.9,
       metalness: 0.0,
     });
 
@@ -235,6 +244,18 @@ export default function ThreeMap({
     return shape;
   }
 
+  // ✅ apply materials based on matchedIds + selectedBuildingIds
+  const applyMaterials = (selSet) => {
+    const s = selSet || new Set();
+    meshesRef.current.forEach((m) => {
+      const bid = Number(m.userData.building?.id);
+      const isMatch = matchedIds?.has?.(bid);
+      const isSel = s?.has?.(bid);
+      m.material = isSel ? mats.selected : isMatch ? mats.match : mats.base;
+    });
+  };
+
+  // build scene once when buildings change
   useEffect(() => {
     if (!mountRef.current) return;
 
@@ -244,7 +265,6 @@ export default function ThreeMap({
       rendererRef.current.dispose();
     }
     meshesRef.current = [];
-    setSelectedIds(new Set());
     setSelectedInfo(null);
 
     const width = mountRef.current.clientWidth;
@@ -252,14 +272,13 @@ export default function ThreeMap({
 
     const scene = new THREE.Scene();
 
-    // ✅ Z-UP FIX (this is the main fix)
+    // Z-up
     scene.up.set(0, 0, 1);
-
     scene.background = new THREE.Color(0xe9ecef);
     scene.fog = new THREE.Fog(0xe9ecef, 2200, 14000);
 
     const camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 250000);
-    camera.up.set(0, 0, 1); // ✅ Z-up camera
+    camera.up.set(0, 0, 1);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(width, height);
@@ -291,7 +310,7 @@ export default function ThreeMap({
     sun.shadow.camera.bottom = -7000;
     scene.add(sun);
 
-    // controls (init AFTER camera.up is set)
+    // controls
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.075;
@@ -301,6 +320,7 @@ export default function ThreeMap({
     controls.maxDistance = 30000;
 
     const group = new THREE.Group();
+    groupRef.current = group;
     scene.add(group);
 
     // origin from first building
@@ -312,7 +332,7 @@ export default function ThreeMap({
       [originMx, originMy] = lonLatToMercatorMeters(lon0, lat0);
     }
 
-    // build buildings (Z-up, so extrude depth is “height” correctly)
+    // build buildings
     buildings.forEach((b) => {
       const ll = b.footprint_ll;
       if (!Array.isArray(ll) || ll.length < 3) return;
@@ -358,7 +378,7 @@ export default function ThreeMap({
     box.getSize(size);
     box.getCenter(center);
 
-    // ground (NO rotation now, because Z-up)
+    // ground
     const groundSize = Math.max(size.x, size.y) * 2.6 || 5000;
     const groundTex = makeGroundTexture();
 
@@ -375,39 +395,19 @@ export default function ThreeMap({
     ground.receiveShadow = true;
     scene.add(ground);
 
-    // camera like your screenshot
+    // camera
     const maxDim = Math.max(size.x, size.y, size.z) || 600;
     controls.target.copy(center);
 
     camera.near = 0.1;
     camera.far = maxDim * 120 + 50000;
-    camera.position.set(
-      center.x + maxDim * 1.6,
-      center.y - maxDim * 2.05,
-      center.z + maxDim * 1.25
-    );
+    camera.position.set(center.x + maxDim * 1.6, center.y - maxDim * 2.05, center.z + maxDim * 1.25);
     camera.updateProjectionMatrix();
 
-    // highlight/selection
-    const applyMaterials = (selSet) => {
-      meshesRef.current.forEach((m) => {
-        const bid = m.userData.building?.id;
-        const isMatch = matchedIds?.has?.(bid);
-        const isSel = selSet?.has?.(bid);
-        m.material = isSel ? mats.selected : isMatch ? mats.match : mats.base;
-      });
-    };
+    // ✅ initial materials based on incoming selectedBuildingIds
+    applyMaterials(selectedBuildingIds);
 
-    // apply initial selectedBuildingId (if App passes it)
-    if (selectedBuildingId != null) {
-      const s = new Set([selectedBuildingId]);
-      setSelectedIds(s);
-      applyMaterials(s);
-    } else {
-      applyMaterials(new Set());
-    }
-
-    // click
+    // raycast click
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
 
@@ -423,22 +423,18 @@ export default function ThreeMap({
         const building = hits[0].object.userData.building;
         const bid = building?.id;
 
-        const next = new Set([bid]);
-        setSelectedIds(next);
-        applyMaterials(next);
+        // ✅ delegate toggle to App (source of truth)
         onSelectBuilding?.(bid);
 
+        // tooltip follows click
         setSelectedInfo({
           building,
           x: ev.clientX - rect.left + 8,
           y: ev.clientY - rect.top + 8,
         });
       } else {
-        const empty = new Set();
-        applyMaterials(empty);
-        setSelectedIds(empty);
+        // empty click: just hide tooltip (don’t clear multi-select)
         setSelectedInfo(null);
-        onSelectBuilding?.(null);
       }
     };
 
@@ -472,18 +468,23 @@ export default function ThreeMap({
       renderer.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [buildings, mats, matchedIds, selectedBuildingId, onSelectBuilding]);
+  }, [buildings, mats, matchedIds, onSelectBuilding]);
 
-  // update highlights when matchedIds changes
+  // ✅ When selection changes in App, update materials without rebuilding the scene
   useEffect(() => {
-    const sel = selectedIds || new Set();
-    meshesRef.current.forEach((m) => {
-      const bid = m.userData.building?.id;
-      const isSel = sel?.has?.(bid);
-      const isMatch = matchedIds?.has?.(bid);
-      m.material = isSel ? mats.selected : isMatch ? mats.match : mats.base;
-    });
-  }, [matchedIds, selectedIds, mats]);
+    applyMaterials(selectedBuildingIds);
+
+    // also support old single selectedBuildingId if someone uses it
+    // (if selectedBuildingIds is empty but selectedBuildingId exists, show it selected)
+    if (
+      (!selectedBuildingIds || selectedBuildingIds.size === 0) &&
+      selectedBuildingId !== null &&
+      selectedBuildingId !== undefined
+    ) {
+      applyMaterials(new Set([Number(selectedBuildingId)]));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedBuildingIds, selectedBuildingId, matchedIds, mats]);
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
@@ -520,7 +521,7 @@ export default function ThreeMap({
             <b>Assessed Value:</b> {safeLabel(selectedInfo.building.assessed_value)}
           </div>
           <div style={{ color: "#666", fontSize: 12 }}>
-            Tip: Click to select (selection is obvious because spacing).
+            Tip: Click buildings to toggle multi-select. Save a project to keep the selection.
           </div>
         </div>
       )}
