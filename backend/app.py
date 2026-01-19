@@ -204,6 +204,53 @@ def projects(username):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/load", methods=["POST"])
+def load_project():
+    """Load a saved project and immediately re-apply its filters.
+
+    This makes the "click a saved project" UX deterministic: the backend
+    returns both the stored filters AND the matching ids for highlighting.
+
+    Body:
+      {"username": "ali", "name": "my analysis"}
+
+    Response:
+      {"name": "my analysis", "filters": [...], "matched_ids": [...], "count": N}
+    """
+    try:
+        data = request.get_json(force=True)
+        username = (data.get("username") or "").strip()
+        name = (data.get("name") or "").strip()
+        if not username or not name:
+            return jsonify({"error": "Required: username, name"}), 400
+
+        user = User.query.filter_by(username=username).first()
+        if not user:
+            return jsonify({"error": "Unknown user"}), 404
+
+        project = Project.query.filter_by(user_id=user.id, name=name).first()
+        if not project:
+            return jsonify({"error": "Project not found"}), 404
+
+        try:
+            filters = json.loads(project.filters) if project.filters else []
+        except Exception:
+            filters = []
+
+        payload = fetch_buildings()
+        buildings = payload.get("buildings", [])
+
+        matched = []
+        for b in buildings:
+            if all(_apply_single_filter(b, f) for f in filters):
+                matched.append(b.get("id"))
+
+        return jsonify({"name": name, "filters": filters, "matched_ids": matched, "count": len(matched)})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     # Render sets PORT, local defaults to 5000
     import os
