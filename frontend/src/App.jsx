@@ -37,7 +37,7 @@ export default function App() {
   const [projectName, setProjectName] = useState("");
   const [projects, setProjects] = useState([]);
 
-  const [activeProjectName, setActiveProjectName] = useState(""); // ✅ NEW (shows active)
+  const [activeProjectName, setActiveProjectName] = useState(""); // shows active
 
   const [nlQuery, setNlQuery] = useState("");
   const [filters, setFilters] = useState([]);
@@ -109,9 +109,10 @@ export default function App() {
 
   // ---------- PROJECTS ----------
   async function refreshProjects(user = username) {
-    if (!user) return;
+    const u = (user || "").trim();
+    if (!u) return;
     try {
-      const r = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(user)}`);
+      const r = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(u)}`);
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "Failed to fetch projects");
       setProjects(normalizeProjectsResponse(j));
@@ -304,6 +305,20 @@ export default function App() {
     };
   }, [loading, error, payload, matchedIds]);
 
+  // ✅ NEW: handle selecting a building consistently
+  function handleSelectBuilding(id) {
+    // Save state so user can hit "Back"
+    pushCurrentToHistory();
+
+    setSelectedBuildingId(id);
+
+    // Selecting a building is a “new action”, so exit project lock
+    setActiveProjectName("");
+
+    // If you want selection to not wipe filters, keep as-is (we keep filters)
+    setMapKey((k) => k + 1);
+  }
+
   return (
     <div style={{ display: "grid", gridTemplateColumns: "380px 1fr", height: "100vh" }}>
       {/* Sidebar */}
@@ -430,7 +445,7 @@ export default function App() {
         <div style={{ display: "grid", gap: 8 }}>
           <input
             value={username}
-            onChange={(e) => setUsername(e.target.value)}
+            onChange={(e) => setUsername(e.target.value.trimStart())}
             placeholder="Username (no auth required)"
             style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd" }}
           />
@@ -504,7 +519,7 @@ export default function App() {
           buildings={buildings}
           matchedIds={matchedIds}
           selectedBuildingId={selectedBuildingId}
-          onSelectBuilding={(id) => setSelectedBuildingId(id)}
+          onSelectBuilding={handleSelectBuilding}   {/* ✅ UPDATED */}
         />
       </div>
     </div>
