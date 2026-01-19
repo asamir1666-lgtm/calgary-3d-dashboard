@@ -8,170 +8,135 @@ function safeLabel(v) {
   return String(v);
 }
 
+// lon/lat degrees -> Web Mercator meters (EPSG:3857)
 function lonLatToMercatorMeters(lon, lat) {
   const R = 6378137;
-  const x = (R * (lon * Math.PI)) / 180;
+  const x = R * (lon * Math.PI) / 180;
   const y = R * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
   return [x, y];
 }
 
-function hash01(str) {
-  const s = String(str ?? "");
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return ((h >>> 0) % 100000) / 100000;
-}
-
-function centroidXY(pts) {
-  let cx = 0,
-    cy = 0;
-  for (const [x, y] of pts) {
-    cx += x;
-    cy += y;
-  }
-  return [cx / pts.length, cy / pts.length];
-}
-
-function makePitchedRoof(footprintPts, height, roofMat) {
-  if (!Array.isArray(footprintPts) || footprintPts.length < 3) return null;
-
-  const [cx, cy] = centroidXY(footprintPts);
-
-  let minX = Infinity,
-    maxX = -Infinity,
-    minY = Infinity,
-    maxY = -Infinity;
-  for (const [x, y] of footprintPts) {
-    minX = Math.min(minX, x);
-    maxX = Math.max(maxX, x);
-    minY = Math.min(minY, y);
-    maxY = Math.max(maxY, y);
-  }
-  const dx = maxX - minX;
-  const dy = maxY - minY;
-  if (!isFinite(dx) || !isFinite(dy) || dx < 6 || dy < 6) return null;
-
-  const roofLen = Math.max(dx, dy);
-  const roofWid = Math.min(dx, dy);
-  const rise = Math.max(2.5, Math.min(16, height * 0.22));
-
-  const tri = new THREE.Shape();
-  tri.moveTo(-roofLen / 2, 0);
-  tri.lineTo(roofLen / 2, 0);
-  tri.lineTo(0, rise);
-  tri.closePath();
-
-  const geo = new THREE.ExtrudeGeometry(tri, {
-    depth: roofWid,
-    bevelEnabled: false,
-    steps: 1,
-    curveSegments: 1,
-  });
-  geo.computeVertexNormals();
-
-  const roof = new THREE.Mesh(geo, roofMat);
-  roof.castShadow = true;
-  roof.receiveShadow = true;
-
-  roof.position.set(cx, cy, height + 0.2);
-  roof.rotation.x = Math.PI / 2;
-
-  if (dx < dy) roof.rotation.z = Math.PI / 2;
-
-  roof.position.y -= roofWid / 2;
-
-  return roof;
-}
-
-export default function ThreeMap({
-  buildings,
-  matchedIds,
-  selectedBuildingId,
-  onSelectBuilding,
-}) {
+export default function ThreeMap({ buildings, matchedIds }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
+  const meshesRef = useRef([]);
 
-  const sceneRef = useRef(null);
-  const cameraRef = useRef(null);
-  const controlsRef = useRef(null);
-
-  const meshesRef = useRef([]); // building meshes only
-  const centroidByIdRef = useRef(new Map()); // id -> {x,y,z}
-
+  // Allow selecting multiple buildings (Shift+Click to add/remove).
+  // The info panel shows the last clicked building.
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [selectedInfo, setSelectedInfo] = useState(null);
 
-  const HEIGHT_SCALE = 3.0;
-  const MIN_HEIGHT = 10;
+  // ✅ Map-look tuning
+  // If buildings feel too flat, bump HEIGHT_SCALE up (2.2–3.0).
+  const HEIGHT_SCALE = 2.2;
+  const MIN_HEIGHT = 12;
 
   const mats = useMemo(() => {
-    const wallMatch = new THREE.MeshStandardMaterial({
-      color: 0xd93025,
-      roughness: 0.85,
+    // Procedural "window" texture so extruded polygons read as actual buildings.
+    const makeFacadeTexture = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 256;
+      canvas.height = 512;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+
+      // base facade
+      ctx.fillStyle = "#7b7f86";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // subtle vertical variation
+      for (let x = 0; x < canvas.width; x += 8) {
+        const t = (x / canvas.width) * 0.12;
+        ctx.fillStyle = rgba(255,255,255,${t});
+        ctx.fillRect(x, 0, 1, canvas.height);
+      }
+
+      // windows grid
+      const padX = 18;
+      const padY = 18;
+      const winW = 14;
+      const winH = 18;
+      const gapX = 10;
+      const gapY = 14;
+
+      for (let y = padY; y < canvas.height - padY; y += winH + gapY) {
+        for (let x = padX; x < canvas.width - padX; x += winW + gapX) {
+          const lit = Math.random() < 0.18;
+          ctx.fillStyle = lit
+            ? "rgba(255, 244, 214, 0.85)"
+            : "rgba(30, 36, 44, 0.55)";
+          ctx.fillRect(x, y, winW, winH);
+        }
+      }
+
+      // horizontal bands
+      ctx.fillStyle = "rgba(0,0,0,0.08)";
+      for (let y = 0; y < canvas.height; y += 64) {
+        ctx.fillRect(0, y, canvas.width, 2);
+      }
+
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(1.2, 1.0);
+      tex.anisotropy = 8;
+      tex.needsUpdate = true;
+      return tex;
+    };
+
+    const facadeTex = makeFacadeTexture();
+
+    // Wall + roof separation
+    const wallBase = new THREE.MeshStandardMaterial({
+      map: facadeTex || null,
+      color: 0x9aa0a6,
+      roughness: 0.92,
       metalness: 0.02,
-      emissive: 0x5b1512,
-      emissiveIntensity: 0.55,
+      emissive: 0x000000,
+      emissiveIntensity: 0.25,
     });
-    const roofMatch = new THREE.MeshStandardMaterial({
-      color: 0xb3261e,
-      roughness: 0.9,
+
+    const roofBase = new THREE.MeshStandardMaterial({
+      color: 0x7c828a, // slightly brighter roof so it reads clearly
+      roughness: 0.95,
       metalness: 0.02,
     });
 
-    const wallSelected = new THREE.MeshStandardMaterial({
-      color: 0x1a73e8,
-      roughness: 0.82,
-      metalness: 0.02,
-      emissive: 0x0b2a66,
-      emissiveIntensity: 0.6,
-    });
-    const roofSelected = new THREE.MeshStandardMaterial({
-      color: 0x1558b0,
-      roughness: 0.9,
-      metalness: 0.02,
-    });
+    // Match tint
+    const wallMatch = wallBase.clone();
+    wallMatch.color = new THREE.Color(0xd93025);
+    wallMatch.emissive = new THREE.Color(0x6b1a16);
+    wallMatch.emissiveIntensity = 0.55;
 
-    const ground = new THREE.MeshStandardMaterial({
-      color: 0xf2f2f2,
-      roughness: 1.0,
-      metalness: 0.0,
-    });
+    const roofMatch = roofBase.clone();
+    roofMatch.color = new THREE.Color(0xb3261e);
 
-    const platform = new THREE.MeshStandardMaterial({
-      color: 0xe7e7e7,
-      roughness: 1.0,
-      metalness: 0.0,
-    });
+    // Selected tint
+    const wallSelected = wallBase.clone();
+    wallSelected.color = new THREE.Color(0x1a73e8);
+    wallSelected.emissive = new THREE.Color(0x0b2a66);
+    wallSelected.emissiveIntensity = 0.6;
 
-    const road = new THREE.MeshStandardMaterial({
-      color: 0x2b2b2b,
-      roughness: 1.0,
-      metalness: 0.0,
-    });
-
-    const majorRoad = new THREE.MeshStandardMaterial({
-      color: 0x1f1f1f,
-      roughness: 1.0,
-      metalness: 0.0,
-    });
-
-    const edge = new THREE.LineBasicMaterial({
-      color: 0x000000,
-      transparent: true,
-      opacity: 0.12,
-    });
+    const roofSelected = roofBase.clone();
+    roofSelected.color = new THREE.Color(0x1558b0);
 
     return {
+      // ExtrudeGeometry groups: [front, back, sides]
+      // front/back = caps (roof surfaces), sides = walls
+      base: [roofBase, roofBase, wallBase],
       match: [roofMatch, roofMatch, wallMatch],
       selected: [roofSelected, roofSelected, wallSelected],
-      ground,
-      platform,
-      road,
-      majorRoad,
-      edge,
+      ground: new THREE.MeshStandardMaterial({
+        color: 0xf2f2f2,
+        roughness: 1.0,
+        metalness: 0.0,
+      }),
+      edge: new THREE.LineBasicMaterial({
+        color: 0x000000,
+        transparent: true,
+        opacity: 0.12,
+      }),
     };
   }, []);
 
@@ -180,6 +145,7 @@ export default function ThreeMap({
 
     let pts = pointsXY.map(([x, y]) => new THREE.Vector2(Number(x), Number(y)));
 
+    // Drop duplicate last point if same as first
     if (pts.length >= 2) {
       const a = pts[0];
       const b = pts[pts.length - 1];
@@ -187,6 +153,7 @@ export default function ThreeMap({
     }
     if (pts.length < 3) return null;
 
+    // Ensure CCW winding
     if (THREE.ShapeUtils.isClockWise(pts)) pts.reverse();
 
     const shape = new THREE.Shape();
@@ -194,36 +161,6 @@ export default function ThreeMap({
     for (let i = 1; i < pts.length; i++) shape.lineTo(pts[i].x, pts[i].y);
     shape.closePath();
     return shape;
-  }
-
-  function applyMaterials() {
-    const selId = selectedBuildingId ?? null;
-
-    for (const m of meshesRef.current) {
-      const bid = m.userData.building?.id;
-      const isMatch = matchedIds?.has?.(bid);
-      const isSel = selId !== null && bid === selId;
-
-      if (isSel) m.material = mats.selected;
-      else if (isMatch) m.material = mats.match;
-      else m.material = m.userData.baseMatArray;
-    }
-  }
-
-  function focusOnBuildingId(bid) {
-    if (!bid) return;
-    const controls = controlsRef.current;
-    const camera = cameraRef.current;
-    const cent = centroidByIdRef.current.get(bid);
-    if (!controls || !camera || !cent) return;
-
-    const target = new THREE.Vector3(cent.x, cent.y, 0);
-    controls.target.copy(target);
-
-    // go to a nice angle
-    const dist = 900;
-    camera.position.set(target.x + dist * 0.9, target.y - dist * 1.2, Math.max(260, cent.z + 420));
-    camera.updateProjectionMatrix();
   }
 
   useEffect(() => {
@@ -234,9 +171,8 @@ export default function ThreeMap({
       rendererRef.current.domElement?.remove();
       rendererRef.current.dispose();
     }
-
     meshesRef.current = [];
-    centroidByIdRef.current = new Map();
+    setSelectedIds(new Set());
     setSelectedInfo(null);
 
     const width = mountRef.current.clientWidth;
@@ -244,21 +180,24 @@ export default function ThreeMap({
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0xeceff1);
-    scene.fog = new THREE.Fog(0xeceff1, 2000, 14000);
+    scene.fog = new THREE.Fog(0xeceff1, 1500, 9000);
 
-    const camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 250000);
+    const camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 200000);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(width, height);
     renderer.setPixelRatio(window.devicePixelRatio || 1);
 
+    // ✅ better “map” look
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.05;
 
+    // ✅ shadows
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
+    // ✅ environment lighting for more realistic materials
     const pmrem = new THREE.PMREMGenerator(renderer);
     scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
@@ -266,41 +205,39 @@ export default function ThreeMap({
     mountRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    sceneRef.current = scene;
-    cameraRef.current = camera;
-
+    // lights
     scene.add(new THREE.AmbientLight(0xffffff, 0.35));
 
     const sun = new THREE.DirectionalLight(0xffffff, 1.0);
-    sun.position.set(1600, -1200, 2200);
+    sun.position.set(1200, -900, 1800);
     sun.castShadow = true;
     sun.shadow.mapSize.width = 2048;
     sun.shadow.mapSize.height = 2048;
     sun.shadow.camera.near = 1;
-    sun.shadow.camera.far = 14000;
-    sun.shadow.camera.left = -6000;
-    sun.shadow.camera.right = 6000;
-    sun.shadow.camera.top = 6000;
-    sun.shadow.camera.bottom = -6000;
+    sun.shadow.camera.far = 9000;
+    sun.shadow.camera.left = -4000;
+    sun.shadow.camera.right = 4000;
+    sun.shadow.camera.top = 4000;
+    sun.shadow.camera.bottom = -4000;
     scene.add(sun);
 
-    const fill = new THREE.DirectionalLight(0xffffff, 0.22);
-    fill.position.set(-1200, 1600, 1100);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.25);
+    fill.position.set(-900, 1200, 900);
     scene.add(fill);
 
+    // controls
     const controls = new OrbitControls(camera, renderer.domElement);
-    controlsRef.current = controls;
     controls.enableDamping = true;
     controls.dampingFactor = 0.07;
     controls.screenSpacePanning = false;
     controls.maxPolarAngle = Math.PI / 2.05;
-    controls.minDistance = 120;
-    controls.maxDistance = 22000;
+    controls.minDistance = 80;
+    controls.maxDistance = 14000;
 
     const group = new THREE.Group();
     scene.add(group);
 
-    // origin
+    // ----- Convert buildings to meters + choose a consistent origin -----
     let originMx = 0;
     let originMy = 0;
 
@@ -312,8 +249,7 @@ export default function ThreeMap({
       [originMx, originMy] = lonLatToMercatorMeters(Number(lon0), Number(lat0));
     }
 
-    const centroids = [];
-
+    // Build meshes
     buildings.forEach((b) => {
       const ll = b.footprint_ll;
       if (!Array.isArray(ll) || ll.length < 3) return;
@@ -326,168 +262,90 @@ export default function ThreeMap({
       const shape = makeShape(ptsMeters);
       if (!shape) return;
 
-      const baseH = Number(b.height) || 10;
-      const r = hash01(b.id ?? b.address ?? JSON.stringify(ll).slice(0, 40));
-      const jitter = 0.9 + r * 0.7;
-      const h = Math.max(MIN_HEIGHT, baseH * HEIGHT_SCALE * jitter);
-
-      const hue = 0.55 + r * 0.12;
-      const sat = 0.08 + r * 0.1;
-      const light = 0.55 + r * 0.12;
-
-      const wallColor = new THREE.Color().setHSL(hue, sat, light);
-      const roofColor = new THREE.Color().setHSL(hue, sat * 0.7, light * 0.85);
-
-      const wallMat = new THREE.MeshStandardMaterial({
-        color: wallColor,
-        roughness: 0.9,
-        metalness: 0.02,
-      });
-
-      const roofMat = new THREE.MeshStandardMaterial({
-        color: roofColor,
-        roughness: 0.95,
-        metalness: 0.02,
-      });
-
-      const baseMatArray = [roofMat, roofMat, wallMat];
+      const rawH = Number(b.height) || 10;
+      const h = Math.max(MIN_HEIGHT, rawH * HEIGHT_SCALE);
 
       const geo = new THREE.ExtrudeGeometry(shape, {
         depth: h,
         bevelEnabled: false,
-        curveSegments: 1,
+        curveSegments: 2,
         steps: 1,
       });
       geo.computeVertexNormals();
 
-      const mesh = new THREE.Mesh(geo, baseMatArray);
-      mesh.userData = { building: b, baseMatArray };
+      const mesh = new THREE.Mesh(geo, mats.base);
+      mesh.userData = { building: b };
+
+      // ✅ Make it read like a city: shadows + sit on ground
+      mesh.position.z = 0;
       mesh.castShadow = true;
       mesh.receiveShadow = true;
 
+      // outline
       const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), mats.edge);
       edges.raycast = () => null;
       mesh.add(edges);
 
       group.add(mesh);
       meshesRef.current.push(mesh);
-
-      const [cx, cy] = centroidXY(ptsMeters);
-      centroids.push({ id: b.id, x: cx, y: cy, z: h });
-      centroidByIdRef.current.set(b.id, { x: cx, y: cy, z: h });
-
-      if (r < 0.35) {
-        const roof = makePitchedRoof(ptsMeters, h, roofMat);
-        if (roof) group.add(roof);
-      }
     });
 
-    // fit bounds
+    // Ground sized to content
     const box = new THREE.Box3().setFromObject(group);
     const size = new THREE.Vector3();
     const center = new THREE.Vector3();
     box.getSize(size);
     box.getCenter(center);
 
-    const groundSize = Math.max(size.x, size.y) * 2.4 || 4500;
+    // ✅ Bigger ground so it feels like a "map"
+    const groundSize = Math.max(size.x, size.y) * 1.8 || 3000;
 
-    // platform
-    const platformThickness = Math.max(20, groundSize * 0.005);
-    const platform = new THREE.Mesh(
-      new THREE.BoxGeometry(groundSize, groundSize, platformThickness),
-      mats.platform
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(groundSize, groundSize),
+      mats.ground
     );
-    platform.position.set(center.x, center.y, -platformThickness / 2);
-    platform.receiveShadow = true;
-    scene.add(platform);
-
-    // ground
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), mats.ground);
     ground.rotation.x = -Math.PI / 2;
     ground.position.set(center.x, center.y, 0);
     ground.receiveShadow = true;
     scene.add(ground);
 
-    // grid
-    const gridHelper = new THREE.GridHelper(groundSize, 120, 0x000000, 0x000000);
-    gridHelper.position.set(center.x, center.y, 0.02);
+    // ✅ Single subtle grid (data-sized)
+    const gridHelper = new THREE.GridHelper(groundSize, 100, 0x000000, 0x000000);
+    gridHelper.position.set(center.x, center.y, 0.01);
+
     if (Array.isArray(gridHelper.material)) {
       gridHelper.material.forEach((m) => {
         m.transparent = true;
-        m.opacity = 0.1;
+        m.opacity = 0.05;
       });
     } else {
       gridHelper.material.transparent = true;
-      gridHelper.material.opacity = 0.1;
+      gridHelper.material.opacity = 0.05;
     }
     scene.add(gridHelper);
 
-    // roads
-    const roadsGroup = new THREE.Group();
-    scene.add(roadsGroup);
-
-    const majorStep = groundSize / 6;
-    const majorWidth = Math.max(18, groundSize * 0.006);
-
-    for (let i = -3; i <= 3; i++) {
-      const x = center.x + i * majorStep;
-      const roadV = new THREE.Mesh(new THREE.PlaneGeometry(majorWidth, groundSize), mats.majorRoad);
-      roadV.rotation.x = -Math.PI / 2;
-      roadV.position.set(x, center.y, 0.03);
-      roadV.receiveShadow = true;
-      roadsGroup.add(roadV);
-
-      const y = center.y + i * majorStep;
-      const roadH = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, majorWidth), mats.majorRoad);
-      roadH.rotation.x = -Math.PI / 2;
-      roadH.position.set(center.x, y, 0.03);
-      roadH.receiveShadow = true;
-      roadsGroup.add(roadH);
-    }
-
-    const maxLinksPerNode = 2;
-    const roadWidth = Math.max(8, groundSize * 0.003);
-    const maxRoadLen = groundSize * 0.18;
-
-    for (let i = 0; i < centroids.length; i++) {
-      const a = centroids[i];
-      const dists = [];
-      for (let j = 0; j < centroids.length; j++) {
-        if (i === j) continue;
-        const b = centroids[j];
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        const d = Math.sqrt(dx * dx + dy * dy);
-        if (d > 0 && d < maxRoadLen) dists.push({ j, d });
-      }
-      dists.sort((p, q) => p.d - q.d);
-
-      for (let k = 0; k < Math.min(maxLinksPerNode, dists.length); k++) {
-        const b = centroids[dists[k].j];
-        const midX = (a.x + b.x) / 2;
-        const midY = (a.y + b.y) / 2;
-        const len = dists[k].d;
-
-        const seg = new THREE.Mesh(new THREE.PlaneGeometry(roadWidth, len), mats.road);
-        seg.rotation.x = -Math.PI / 2;
-
-        const ang = Math.atan2(b.x - a.x, b.y - a.y);
-        seg.rotation.z = ang;
-
-        seg.position.set(midX, midY, 0.04);
-        seg.receiveShadow = true;
-        roadsGroup.add(seg);
-      }
-    }
-
-    // camera
-    const maxDim = Math.max(size.x, size.y, size.z) || 600;
+    // Fit camera (more “map-like” tilted angle)
+    const maxDim = Math.max(size.x, size.y, size.z) || 400;
     controls.target.copy(center);
 
     camera.near = 0.1;
-    camera.far = maxDim * 80 + 20000;
-    camera.position.set(center.x + maxDim * 1.6, center.y - maxDim * 2.1, center.z + maxDim * 1.25);
+    camera.far = maxDim * 50 + 12000;
+    camera.position.set(
+      center.x + maxDim * 1.2,
+      center.y - maxDim * 1.6,
+      center.z + maxDim * 1.1
+    );
     camera.updateProjectionMatrix();
+
+    // selection/highlight
+    const applyMaterials = (selIds) => {
+      meshesRef.current.forEach((m) => {
+        const bid = m.userData.building?.id;
+        const isMatch = matchedIds?.has?.(bid);
+        const isSel = selIds?.has?.(bid);
+        m.material = isSel ? mats.selected : isMatch ? mats.match : mats.base;
+      });
+    };
 
     // click
     const raycaster = new THREE.Raycaster();
@@ -503,13 +361,20 @@ export default function ThreeMap({
 
       if (hits.length > 0) {
         const building = hits[0].object.userData.building;
-        const bid = building?.id ?? null;
+        const bid = building?.id;
 
-        if (bid !== null && bid !== undefined) {
-          onSelectBuilding?.(bid); // ✅ sends to App so it gets saved
-          applyMaterials();
-          focusOnBuildingId(bid);
-        }
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          if (ev.shiftKey) {
+            if (next.has(bid)) next.delete(bid);
+            else next.add(bid);
+          } else {
+            next.clear();
+            next.add(bid);
+          }
+          applyMaterials(next);
+          return next;
+        });
 
         setSelectedInfo({
           building,
@@ -517,8 +382,9 @@ export default function ThreeMap({
           y: ev.clientY - rect.top + 8,
         });
       } else {
-        onSelectBuilding?.(null);
-        applyMaterials();
+        const empty = new Set();
+        applyMaterials(empty);
+        setSelectedIds(empty);
         setSelectedInfo(null);
       }
     };
@@ -545,9 +411,7 @@ export default function ThreeMap({
     };
     animate();
 
-    // initial paint + focus
-    applyMaterials();
-    if (selectedBuildingId) focusOnBuildingId(selectedBuildingId);
+    applyMaterials(new Set());
 
     return () => {
       cancelAnimationFrame(raf);
@@ -559,12 +423,15 @@ export default function ThreeMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [buildings, mats]);
 
-  // update visuals when matched or selected changes
+  // update highlights when matchedIds changes
   useEffect(() => {
-    applyMaterials();
-    if (selectedBuildingId) focusOnBuildingId(selectedBuildingId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [matchedIds, selectedBuildingId]);
+    meshesRef.current.forEach((m) => {
+      const bid = m.userData.building?.id;
+      const isSelected = selectedIds?.has?.(bid);
+      const isMatch = matchedIds?.has?.(bid);
+      m.material = isSelected ? mats.selected : isMatch ? mats.match : mats.base;
+    });
+  }, [matchedIds, selectedIds, mats]);
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
@@ -599,6 +466,10 @@ export default function ThreeMap({
           </div>
           <div style={{ marginBottom: 10 }}>
             <b>Assessed Value:</b> {safeLabel(selectedInfo.building.assessed_value)}
+          </div>
+
+          <div style={{ marginBottom: 10, color: "#555", fontSize: 12 }}>
+            Selected: <b>{selectedIds.size}</b> (Shift+Click to multi-select)
           </div>
 
           <div style={{ fontWeight: 800, marginBottom: 6 }}>Raw data</div>
