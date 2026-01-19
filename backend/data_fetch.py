@@ -2,8 +2,8 @@
 
 Why this version:
 - Some Socrata datasets do NOT include polygon geometry in the plain .json rows.
-- The Socrata GeoJSON endpoint reliably includes geometry in features[].geometry.  :contentReference[oaicite:2]{index=2}
-- Calgary "3D Buildings - Citywide" uses projected coordinates (meters), not lon/lat. :contentReference[oaicite:3]{index=3}
+- The Socrata GeoJSON endpoint reliably includes geometry in features[].geometry.
+- Calgary "3D Buildings - Citywide" uses projected coordinates (meters), not lon/lat.
 
 What this returns:
 {
@@ -34,8 +34,8 @@ DEFAULT_BBOX = {
 # How many features to fetch from the GeoJSON endpoint
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "8000"))
 
-# Approx “3–4 blocks” window size in meters for projected datasets
-WINDOW_METERS = float(os.getenv("WINDOW_METERS", "650"))
+# ✅ Approx “~5 blocks” window size in meters (smaller than 650)
+WINDOW_METERS = float(os.getenv("WINDOW_METERS", "450"))
 
 
 def _as_float(v: Any) -> Optional[float]:
@@ -110,12 +110,13 @@ def _choose_projected_window(features: List[Dict[str, Any]]) -> Dict[str, float]
     raise RuntimeError("No valid polygon geometries found in GeoJSON features.")
 
 
-def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 400) -> Dict[str, Any]:
+def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> Dict[str, Any]:
+    """✅ limit reduced to 200 so you don’t render too many buildings."""
     bbox = bbox or DEFAULT_BBOX
 
     features = _fetch_geojson_features()
 
-    # This dataset is projected meters -> choose a contiguous “few blocks” window
+    # This dataset is projected meters -> choose a contiguous “~5 blocks” window
     win = _choose_projected_window(features)
     origin_x = (win["min_x"] + win["max_x"]) / 2.0
     origin_y = (win["min_y"] + win["max_y"]) / 2.0
@@ -159,9 +160,9 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 400) -> D
                 "zoning": zoning,
                 "assessed_value": assessed_value,
                 "address": address,
-                "footprint_ll": footprint_ll,     # raw projected coords
-                "footprint_xy": footprint_xy,     # centered for Three.js
-                "properties": props,              # popup always has data
+                "footprint_ll": footprint_ll,  # raw projected coords
+                "footprint_xy": footprint_xy,  # centered for Three.js
+                "properties": props,           # popup always has data
             }
         )
 
@@ -169,14 +170,13 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 400) -> D
             break
 
     if not buildings:
-        raise RuntimeError(
-            "0 buildings after filtering. Increase FETCH_LIMIT or WINDOW_METERS."
-        )
+        raise RuntimeError("0 buildings after filtering. Increase FETCH_LIMIT or WINDOW_METERS.")
 
     return {
         "bbox": bbox,
         "projection": {"coord_system": "projected_meters", "origin_x": origin_x, "origin_y": origin_y},
         "window_meters": win,
+        "area_m2": WINDOW_METERS * WINDOW_METERS,  # ✅ proof in response
         "count": len(buildings),
         "buildings": buildings,
     }
