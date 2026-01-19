@@ -1,12 +1,13 @@
 """Calgary Open Data fetch + normalization.
 
-We keep this small but robust:
-- Fetch building polygons for a 3-4 block bounding box.
-- Normalize to a stable JSON shape for the frontend.
-- Project lon/lat to local XY meters for Three.js.
+Robust for Socrata geometry:
+- Some Calgary datasets store geometry in projected meters (not lon/lat).
+- within_box() may be rejected for some geometry columns.
+- We fetch a batch, detect coord system, then choose a 3–4 block window automatically.
 
-If a field (height, zoning, etc.) is missing, we keep the raw properties
-so the popup always has data.
+Output:
+- buildings[] with footprint_xy ready for Three.js
+- properties retained for popups
 """
 
 from __future__ import annotations
@@ -18,10 +19,9 @@ from typing import Any, Dict, List, Tuple
 import requests
 
 
-# City of Calgary Open Data (Socrata)
 SOCRATA_URL = "https://data.calgary.ca/resource/cchr-krqg.json"
 
-# Default downtown bbox (roughly 3-4 blocks). You can change these if you want.
+# User-provided bbox (works only if dataset is lon/lat). Keep it, but we may ignore it.
 DEFAULT_BBOX = {
     "south": float(os.getenv("BBOX_S", "51.046")),
     "west": float(os.getenv("BBOX_W", "-114.071")),
@@ -29,12 +29,14 @@ DEFAULT_BBOX = {
     "east": float(os.getenv("BBOX_E", "-114.065")),
 }
 
-# If Socrata rejects within_box, we fetch a bigger batch and filter locally
+# How many records to fetch when server-side filtering fails / is unusable
 FALLBACK_LIMIT = int(os.getenv("FALLBACK_LIMIT", "5000"))
+
+# Approx “3–4 blocks” window size (meters) if dataset uses projected coordinates
+WINDOW_METERS = float(os.getenv("WINDOW_METERS", "600"))  # 600m ~ several city blocks
 
 
 def _first_geom(record: Dict[str, Any]) -> Dict[str, Any] | None:
-    """Socrata datasets vary: some use 'the_geom', others 'geom'."""
     return record.get("the_geom") or record.get("geom")
 
 
@@ -62,7 +64,6 @@ def _project_lonlat_to_xy(
 
 
 def _extract_ring_coords(geom: Dict[str, Any]) -> List[List[float]] | None:
-    """Return outer ring [[lon,lat], ...] if Polygon or MultiPolygon."""
     if not geom:
         return None
     gtype = geom.get("type")
@@ -71,8 +72,10 @@ def _extract_ring_coords(geom: Dict[str, Any]) -> List[List[float]] | None:
         return None
 
     if gtype == "Polygon":
-        if isinstance(coords, list) and len(coords) > 0 and isinstance(coords[0], list):
+        try:
             return coords[0]
+        except Exception:
+            return None
 
     if gtype == "MultiPolygon":
         try:
@@ -83,16 +86,24 @@ def _extract_ring_coords(geom: Dict[str, Any]) -> List[List[float]] | None:
     return None
 
 
-def _ring_intersects_bbox(ring: List[List[float]], bbox: Dict[str, float]) -> bool:
-    """Fast bbox overlap test using ring lon/lat extents."""
+def _looks_like_lonlat(ring: List[List[float]]) -> bool:
+    """
+    Heuristic: lon/lat values are usually within [-180..180], [-90..90].
+    Projected meters will be way larger (thousands/millions).
+    """
+    if not ring:
+        return False
+    x0, y0 = ring[0][0], ring[0][1]
+    return (abs(x0) <= 180.0) and (abs(y0) <= 90.0)
+
+
+def _ring_intersects_bbox_lonlat(ring: List[List[float]], bbox: Dict[str, float]) -> bool:
     lons = [p[0] for p in ring]
     lats = [p[1] for p in ring]
     if not lons or not lats:
         return False
-
     min_lon, max_lon = min(lons), max(lons)
     min_lat, max_lat = min(lats), max(lats)
-
     return not (
         max_lon < bbox["west"]
         or min_lon > bbox["east"]
@@ -101,70 +112,82 @@ def _ring_intersects_bbox(ring: List[List[float]], bbox: Dict[str, float]) -> bo
     )
 
 
-def _fetch_raw(bbox: Dict[str, float], limit: int) -> List[Dict[str, Any]]:
-    """
-    Try Socrata server-side within_box first.
-    If Socrata returns 400 (common on some assets), fallback to client-side filtering.
-    """
-    north = bbox["north"]
-    west = bbox["west"]
-    south = bbox["south"]
-    east = bbox["east"]
+def _ring_intersects_window_xy(ring: List[List[float]], win: Dict[str, float]) -> bool:
+    xs = [p[0] for p in ring]
+    ys = [p[1] for p in ring]
+    if not xs or not ys:
+        return False
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    return not (
+        max_x < win["min_x"]
+        or min_x > win["max_x"]
+        or max_y < win["min_y"]
+        or min_y > win["max_y"]
+    )
 
-    # 1) Try within_box with common geometry fields
-    for geom_field in ("the_geom", "geom"):
-        params = {
-            "$limit": limit,
-            "$where": f"within_box({geom_field},{north},{west},{south},{east})",
-        }
-        r = requests.get(SOCRATA_URL, params=params, timeout=30)
 
-        # If this geom_field/where is rejected, try next
-        if r.status_code == 400:
-            continue
-
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list) and len(data) > 0:
-            return data
-
-    # 2) Fallback: fetch a larger batch and filter locally by bbox
-    # (Still satisfies "from public API" — we just filter in Python.)
+def _fetch_batch() -> List[Dict[str, Any]]:
     r = requests.get(SOCRATA_URL, params={"$limit": FALLBACK_LIMIT}, timeout=60)
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, list):
         raise RuntimeError("Unexpected Socrata response shape (expected list).")
+    return data
 
-    filtered: List[Dict[str, Any]] = []
-    for rec in data:
-        geom = _first_geom(rec)
-        ring = _extract_ring_coords(geom) if geom else None
-        if not ring:
+
+def _choose_projected_window(records: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Pick a seed building that has geometry, then create a WINDOW_METERS square around it.
+    This gives a contiguous “few blocks” area regardless of coordinate system origin.
+    """
+    half = WINDOW_METERS / 2.0
+
+    for rec in records:
+        ring = _extract_ring_coords(_first_geom(rec) or {})
+        if not ring or len(ring) < 3:
             continue
-        if _ring_intersects_bbox(ring, bbox):
-            filtered.append(rec)
-        if len(filtered) >= limit:
-            break
 
-    if not filtered:
-        raise RuntimeError(
-            "Fallback fetch returned 0 buildings in bbox. "
-            "Try adjusting BBOX_N/E/S/W env vars."
-        )
+        # Use first point as a quick anchor
+        x0, y0 = float(ring[0][0]), float(ring[0][1])
+        return {"min_x": x0 - half, "max_x": x0 + half, "min_y": y0 - half, "max_y": y0 + half}
 
-    return filtered
+    raise RuntimeError("No valid geometries found in fetched batch.")
 
 
 def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> Dict[str, Any]:
-    """Fetch and return normalized buildings + projection metadata."""
     bbox = bbox or DEFAULT_BBOX
 
-    raw = _fetch_raw(bbox, limit)
+    raw = _fetch_batch()
 
-    # Compute reference center for projection
-    lat0 = (bbox["south"] + bbox["north"]) / 2.0
-    lon0 = (bbox["west"] + bbox["east"]) / 2.0
+    # Find first usable ring to detect coordinate type
+    sample_ring = None
+    for rec in raw:
+        g = _first_geom(rec)
+        ring = _extract_ring_coords(g) if g else None
+        if ring and len(ring) >= 3:
+            sample_ring = ring
+            break
+
+    if not sample_ring:
+        raise RuntimeError("No valid building polygons returned from Calgary API.")
+
+    is_lonlat = _looks_like_lonlat(sample_ring)
+
+    # If projected coords, auto-select a contiguous window (3–4 blocks)
+    projected_window = None
+    if not is_lonlat:
+        projected_window = _choose_projected_window(raw)
+
+    # Projection anchor:
+    # - for lon/lat, compute from bbox center
+    # - for projected, use window center (and treat coords as already meters)
+    if is_lonlat:
+        lat0 = (bbox["south"] + bbox["north"]) / 2.0
+        lon0 = (bbox["west"] + bbox["east"]) / 2.0
+    else:
+        lat0 = 0.0
+        lon0 = 0.0
 
     buildings: List[Dict[str, Any]] = []
     for idx, rec in enumerate(raw):
@@ -172,6 +195,14 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> D
         ring = _extract_ring_coords(geom) if geom else None
         if not ring or len(ring) < 3:
             continue
+
+        # Filter to the target area
+        if is_lonlat:
+            if not _ring_intersects_bbox_lonlat(ring, bbox):
+                continue
+        else:
+            if projected_window and not _ring_intersects_window_xy(ring, projected_window):
+                continue
 
         height = (
             _as_float(rec.get("height"))
@@ -189,9 +220,15 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> D
             or _as_float(rec.get("value"))
         )
 
-        # Project footprint
+        # Footprints
         footprint_ll = [[float(p[0]), float(p[1])] for p in ring]
-        footprint_xy = [list(_project_lonlat_to_xy(p[0], p[1], lon0, lat0)) for p in footprint_ll]
+
+        if is_lonlat:
+            footprint_xy = [list(_project_lonlat_to_xy(p[0], p[1], lon0, lat0)) for p in footprint_ll]
+        else:
+            # Already in meters (projected). Just normalize around first point to avoid huge coordinates in Three.js.
+            x_ref, y_ref = footprint_ll[0][0], footprint_ll[0][1]
+            footprint_xy = [[p[0] - x_ref, p[1] - y_ref] for p in footprint_ll]
 
         buildings.append(
             {
@@ -202,13 +239,17 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> D
                 "address": address,
                 "footprint_ll": footprint_ll,
                 "footprint_xy": footprint_xy,
-                "properties": rec,  # keep raw so popup always has data
+                "properties": rec,
             }
         )
 
+        if len(buildings) >= limit:
+            break
+
     return {
         "bbox": bbox,
-        "projection": {"lat0": lat0, "lon0": lon0},
+        "projection": {"lat0": lat0, "lon0": lon0, "coord_system": "lonlat" if is_lonlat else "projected_meters"},
+        "window_meters": projected_window,
         "count": len(buildings),
         "buildings": buildings,
     }
