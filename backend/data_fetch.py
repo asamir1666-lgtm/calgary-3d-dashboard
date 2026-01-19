@@ -1,27 +1,27 @@
-"""Calgary Open Data fetch + normalization.
+"""Calgary Open Data fetch + normalization (robust).
 
-Robust for Socrata geometry:
-- Some Calgary datasets store geometry in projected meters (not lon/lat).
-- within_box() may be rejected for some geometry columns.
-- We fetch a batch, detect coord system, then choose a 3–4 block window automatically.
-
-Output:
-- buildings[] with footprint_xy ready for Three.js
-- properties retained for popups
+- Fetch 3D building polygons from Calgary Open Data (Socrata).
+- Normalize to stable JSON for frontend.
+- Support geometry stored as:
+  - different field names (the_geom, geom, multipolygon, shape, geometry)
+  - dict OR JSON-string
+- Works for projected coordinate datasets (meters), and uses a single shared origin
+  so all buildings share the same XY coordinate space (better Three.js controls/selection).
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import requests
 
 
 SOCRATA_URL = "https://data.calgary.ca/resource/cchr-krqg.json"
 
-# User-provided bbox (works only if dataset is lon/lat). Keep it, but we may ignore it.
+# These lon/lat bbox env vars are kept for compatibility, but this dataset is often projected.
 DEFAULT_BBOX = {
     "south": float(os.getenv("BBOX_S", "51.046")),
     "west": float(os.getenv("BBOX_W", "-114.071")),
@@ -29,18 +29,13 @@ DEFAULT_BBOX = {
     "east": float(os.getenv("BBOX_E", "-114.065")),
 }
 
-# How many records to fetch when server-side filtering fails / is unusable
-FALLBACK_LIMIT = int(os.getenv("FALLBACK_LIMIT", "5000"))
+FALLBACK_LIMIT = int(os.getenv("FALLBACK_LIMIT", "8000"))
 
-# Approx “3–4 blocks” window size (meters) if dataset uses projected coordinates
-WINDOW_METERS = float(os.getenv("WINDOW_METERS", "600"))  # 600m ~ several city blocks
-
-
-def _first_geom(record: Dict[str, Any]) -> Dict[str, Any] | None:
-    return record.get("the_geom") or record.get("geom")
+# ~3–4 blocks window if dataset is projected meters (tune if you want)
+WINDOW_METERS = float(os.getenv("WINDOW_METERS", "650"))
 
 
-def _as_float(v: Any) -> float | None:
+def _as_float(v: Any) -> Optional[float]:
     try:
         if v is None:
             return None
@@ -49,13 +44,7 @@ def _as_float(v: Any) -> float | None:
         return None
 
 
-def _project_lonlat_to_xy(
-    lon: float,
-    lat: float,
-    lon0: float,
-    lat0: float,
-) -> Tuple[float, float]:
-    """Approx lon/lat -> local meters (good enough for a few city blocks)."""
+def _project_lonlat_to_xy(lon: float, lat: float, lon0: float, lat0: float) -> Tuple[float, float]:
     meters_per_deg_lat = 111_320.0
     meters_per_deg_lon = 111_320.0 * math.cos(math.radians(lat0))
     x = (lon - lon0) * meters_per_deg_lon
@@ -63,7 +52,35 @@ def _project_lonlat_to_xy(
     return x, y
 
 
-def _extract_ring_coords(geom: Dict[str, Any]) -> List[List[float]] | None:
+def _coerce_geom(value: Any) -> Optional[Dict[str, Any]]:
+    """Accept dict OR JSON-string geometry."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        # Sometimes Socrata returns geometry as a JSON string
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            try:
+                parsed = json.loads(s)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return None
+    return None
+
+
+def _first_geom(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Try multiple common geometry keys, and coerce string->dict if needed."""
+    for k in ("the_geom", "geom", "multipolygon", "shape", "geometry"):
+        g = _coerce_geom(record.get(k))
+        if g:
+            return g
+    return None
+
+
+def _extract_ring_coords(geom: Dict[str, Any]) -> Optional[List[List[float]]]:
+    """Return outer ring [[x,y], ...] from Polygon or MultiPolygon."""
     if not geom:
         return None
     gtype = geom.get("type")
@@ -83,48 +100,22 @@ def _extract_ring_coords(geom: Dict[str, Any]) -> List[List[float]] | None:
         except Exception:
             return None
 
+    # Some datasets may store as "Multipolygon" etc (case variants)
+    if isinstance(gtype, str) and gtype.lower() == "multipolygon":
+        try:
+            return coords[0][0]
+        except Exception:
+            return None
+
     return None
 
 
 def _looks_like_lonlat(ring: List[List[float]]) -> bool:
-    """
-    Heuristic: lon/lat values are usually within [-180..180], [-90..90].
-    Projected meters will be way larger (thousands/millions).
-    """
+    """Heuristic: lon/lat ~ within [-180..180], [-90..90]. Projected meters are huge."""
     if not ring:
         return False
-    x0, y0 = ring[0][0], ring[0][1]
+    x0, y0 = float(ring[0][0]), float(ring[0][1])
     return (abs(x0) <= 180.0) and (abs(y0) <= 90.0)
-
-
-def _ring_intersects_bbox_lonlat(ring: List[List[float]], bbox: Dict[str, float]) -> bool:
-    lons = [p[0] for p in ring]
-    lats = [p[1] for p in ring]
-    if not lons or not lats:
-        return False
-    min_lon, max_lon = min(lons), max(lons)
-    min_lat, max_lat = min(lats), max(lats)
-    return not (
-        max_lon < bbox["west"]
-        or min_lon > bbox["east"]
-        or max_lat < bbox["south"]
-        or min_lat > bbox["north"]
-    )
-
-
-def _ring_intersects_window_xy(ring: List[List[float]], win: Dict[str, float]) -> bool:
-    xs = [p[0] for p in ring]
-    ys = [p[1] for p in ring]
-    if not xs or not ys:
-        return False
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    return not (
-        max_x < win["min_x"]
-        or min_x > win["max_x"]
-        or max_y < win["min_y"]
-        or min_y > win["max_y"]
-    )
 
 
 def _fetch_batch() -> List[Dict[str, Any]]:
@@ -136,31 +127,46 @@ def _fetch_batch() -> List[Dict[str, Any]]:
     return data
 
 
+def _bbox_of_ring(ring: List[List[float]]) -> Tuple[float, float, float, float]:
+    xs = [float(p[0]) for p in ring]
+    ys = [float(p[1]) for p in ring]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _intersects_window(ring: List[List[float]], win: Dict[str, float]) -> bool:
+    minx, miny, maxx, maxy = _bbox_of_ring(ring)
+    return not (
+        maxx < win["min_x"]
+        or minx > win["max_x"]
+        or maxy < win["min_y"]
+        or miny > win["max_y"]
+    )
+
+
 def _choose_projected_window(records: List[Dict[str, Any]]) -> Dict[str, float]:
-    """
-    Pick a seed building that has geometry, then create a WINDOW_METERS square around it.
-    This gives a contiguous “few blocks” area regardless of coordinate system origin.
-    """
+    """Pick a seed building with valid polygon, then define a WINDOW_METERS square around it."""
     half = WINDOW_METERS / 2.0
-
     for rec in records:
-        ring = _extract_ring_coords(_first_geom(rec) or {})
-        if not ring or len(ring) < 3:
-            continue
-
-        # Use first point as a quick anchor
-        x0, y0 = float(ring[0][0]), float(ring[0][1])
-        return {"min_x": x0 - half, "max_x": x0 + half, "min_y": y0 - half, "max_y": y0 + half}
-
-    raise RuntimeError("No valid geometries found in fetched batch.")
+        g = _first_geom(rec)
+        ring = _extract_ring_coords(g) if g else None
+        if ring and len(ring) >= 3:
+            x0, y0 = float(ring[0][0]), float(ring[0][1])
+            return {"min_x": x0 - half, "max_x": x0 + half, "min_y": y0 - half, "max_y": y0 + half}
+    raise RuntimeError("No valid building polygons found in fetched batch (geometry missing/unreadable).")
 
 
-def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> Dict[str, Any]:
+def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 400) -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        bbox, projection, window_meters, count,
+        buildings: [{id,height,zoning,assessed_value,address,footprint_ll,footprint_xy,properties}]
+      }
+    """
     bbox = bbox or DEFAULT_BBOX
-
     raw = _fetch_batch()
 
-    # Find first usable ring to detect coordinate type
+    # Find first usable polygon to detect coordinate system
     sample_ring = None
     for rec in raw:
         g = _first_geom(rec)
@@ -170,39 +176,39 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> D
             break
 
     if not sample_ring:
-        raise RuntimeError("No valid building polygons returned from Calgary API.")
+        raise RuntimeError(
+            "No valid building polygons returned from Calgary API. "
+            "Likely geometry field name differs OR geometry is not being included."
+        )
 
     is_lonlat = _looks_like_lonlat(sample_ring)
 
-    # If projected coords, auto-select a contiguous window (3–4 blocks)
-    projected_window = None
-    if not is_lonlat:
-        projected_window = _choose_projected_window(raw)
+    # Choose target area:
+    # - If lon/lat: you can later re-enable a true lon/lat bbox filter if you want
+    # - If projected: auto-pick a 3–4 block window
+    projected_window = _choose_projected_window(raw) if not is_lonlat else None
 
-    # Projection anchor:
-    # - for lon/lat, compute from bbox center
-    # - for projected, use window center (and treat coords as already meters)
+    # Single shared origin for the whole scene
     if is_lonlat:
         lat0 = (bbox["south"] + bbox["north"]) / 2.0
         lon0 = (bbox["west"] + bbox["east"]) / 2.0
+        origin_x, origin_y = 0.0, 0.0  # lon/lat projection uses lon0/lat0
     else:
-        lat0 = 0.0
-        lon0 = 0.0
+        # origin = center of window in meters
+        origin_x = (projected_window["min_x"] + projected_window["max_x"]) / 2.0
+        origin_y = (projected_window["min_y"] + projected_window["max_y"]) / 2.0
+        lat0, lon0 = 0.0, 0.0
 
     buildings: List[Dict[str, Any]] = []
     for idx, rec in enumerate(raw):
-        geom = _first_geom(rec)
-        ring = _extract_ring_coords(geom) if geom else None
+        g = _first_geom(rec)
+        ring = _extract_ring_coords(g) if g else None
         if not ring or len(ring) < 3:
             continue
 
-        # Filter to the target area
-        if is_lonlat:
-            if not _ring_intersects_bbox_lonlat(ring, bbox):
-                continue
-        else:
-            if projected_window and not _ring_intersects_window_xy(ring, projected_window):
-                continue
+        # Filter to 3–4 blocks if projected
+        if projected_window and not _intersects_window(ring, projected_window):
+            continue
 
         height = (
             _as_float(rec.get("height"))
@@ -220,19 +226,17 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> D
             or _as_float(rec.get("value"))
         )
 
-        # Footprints
         footprint_ll = [[float(p[0]), float(p[1])] for p in ring]
 
         if is_lonlat:
             footprint_xy = [list(_project_lonlat_to_xy(p[0], p[1], lon0, lat0)) for p in footprint_ll]
         else:
-            # Already in meters (projected). Just normalize around first point to avoid huge coordinates in Three.js.
-            x_ref, y_ref = footprint_ll[0][0], footprint_ll[0][1]
-            footprint_xy = [[p[0] - x_ref, p[1] - y_ref] for p in footprint_ll]
+            # Projected meters -> shared origin shift
+            footprint_xy = [[p[0] - origin_x, p[1] - origin_y] for p in footprint_ll]
 
         buildings.append(
             {
-                "id": rec.get("id") or rec.get("objectid") or f"b{idx}",
+                "id": rec.get("id") or rec.get("objectid") or rec.get("globalid") or f"b{idx}",
                 "height": height,
                 "zoning": zoning,
                 "assessed_value": assessed_value,
@@ -245,6 +249,12 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 250) -> D
 
         if len(buildings) >= limit:
             break
+
+    if not buildings:
+        raise RuntimeError(
+            "0 buildings after filtering. Increase FALLBACK_LIMIT or WINDOW_METERS, "
+            "or the dataset may not be returning geometry fields."
+        )
 
     return {
         "bbox": bbox,
