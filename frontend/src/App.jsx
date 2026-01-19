@@ -1,411 +1,360 @@
-import React, { useEffect, useMemo, useState } from "react";
-import ThreeMap from "./ThreeMap";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import ThreeMap from "./ThreeMap.jsx";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
 
-function asSet(ids) {
-  if (!ids) return new Set();
-  if (ids instanceof Set) return ids;
-  if (Array.isArray(ids)) return new Set(ids);
-  return new Set();
+function prettyFilter(f) {
+  return `${f.attribute} ${f.operator} ${f.value}`;
 }
 
 export default function App() {
-  const [buildings, setBuildings] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [payload, setPayload] = useState(null); // {bbox, projection, count, buildings}
 
-  // LLM / filtering state
-  const [query, setQuery] = useState("");
-  const [activeFilters, setActiveFilters] = useState([]); // array of {attribute, operator, value, ...}
-  const [matchedIds, setMatchedIds] = useState(new Set());
-
-  // Project persistence UI
-  const [username, setUsername] = useState("");
+  // LLM + persistence UI
+  const [username, setUsername] = useState("ali");
   const [projectName, setProjectName] = useState("");
-  const [projects, setProjects] = useState([]); // list of saved project names/rows
-  const [status, setStatus] = useState("");
+  const [projects, setProjects] = useState([]);
+  const [nlQuery, setNlQuery] = useState("");
+  const [filters, setFilters] = useState([]);
+  const [filtersHistory, setFiltersHistory] = useState([]);
+  const [matchedIds, setMatchedIds] = useState(new Set());
+  const skipNextApplyRef = useRef(false);
 
-  // ✅ History stack so you can go back after save/load/run
-  // Each entry is: { activeFilters, matchedIds }
-  const [history, setHistory] = useState([]);
+  function pushHistory(snapshot) {
+    setFiltersHistory((h) => {
+      const next = [...h, snapshot];
+      // keep it bounded so it doesn't grow forever
+      return next.slice(-20);
+    });
+  }
 
-  // ---------- Load buildings once ----------
+  function goBack() {
+    setFiltersHistory((h) => {
+      if (h.length === 0) return h;
+      const prev = h[h.length - 1];
+      skipNextApplyRef.current = false;
+      setFilters(prev);
+      applyFilters(prev);
+      return h.slice(0, -1);
+    });
+  }
+
+  const buildings = payload?.buildings || [];
+
+  async function loadBuildings() {
+    setLoading(true);
+    setError("");
+    try {
+      const r = await fetch(`${API_BASE}/api/buildings`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j?.error || "Failed to fetch buildings");
+      setPayload(j);
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshProjects(user = username) {
+    if (!user) return;
+    try {
+      const r = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(user)}`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j?.error || "Failed to fetch projects");
+      setProjects(j);
+    } catch (e) {
+      // keep UI usable; don’t hard-fail
+      console.warn(e);
+    }
+  }
+
+  async function applyFilters(nextFilters) {
+    try {
+      const r = await fetch(`${API_BASE}/api/apply_filters`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filters: nextFilters }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j?.error || "Failed to apply filters");
+      setMatchedIds(new Set(j.matched_ids || []));
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
   useEffect(() => {
-    (async () => {
-      try {
-        setStatus("Loading buildings...");
-        const res = await fetch(`${API_BASE}/api/buildings`);
-        if (!res.ok) throw new Error(`Failed to load buildings: ${res.status}`);
-        const data = await res.json();
-        setBuildings(data || []);
-        setStatus("");
-      } catch (e) {
-        console.error(e);
-        setStatus(String(e?.message || e));
-      }
-    })();
+    loadBuildings();
   }, []);
 
-  // ---------- Load saved projects when username changes ----------
   useEffect(() => {
-    if (!username) {
-      setProjects([]);
-      return;
-    }
-    (async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(username)}`);
-        if (!res.ok) throw new Error(`Failed to load projects: ${res.status}`);
-        const data = await res.json();
-        // Support either: {projects:[...]} or [...]
-        const list = Array.isArray(data) ? data : (data.projects || []);
-        setProjects(list);
-      } catch (e) {
-        console.error(e);
-      }
-    })();
+    refreshProjects(username);
   }, [username]);
 
-  // Helpful derived UI
-  const matchedCount = useMemo(() => matchedIds?.size || 0, [matchedIds]);
+  useEffect(() => {
+    if (skipNextApplyRef.current) {
+      skipNextApplyRef.current = false;
+      return;
+    }
+    applyFilters(filters);
+  }, [filters]);
 
-  // ✅ Push current state to history BEFORE changing it
-  const pushHistory = () => {
-    setHistory((prev) => [
-      ...prev,
-      {
-        activeFilters: Array.isArray(activeFilters) ? JSON.parse(JSON.stringify(activeFilters)) : [],
-        matchedIds: Array.from(matchedIds || []),
-      },
-    ]);
-  };
-
-  // ✅ Back: restore previous filters + highlights
-  const handleBack = () => {
-    setHistory((prev) => {
-      if (!prev.length) return prev;
-      const last = prev[prev.length - 1];
-
-      setActiveFilters(last.activeFilters || []);
-      setMatchedIds(new Set(last.matchedIds || []));
-
-      return prev.slice(0, -1);
-    });
-  };
-
-  // ---------- Run NL query ----------
-  const runQuery = async () => {
-    const q = query.trim();
+  async function runLLMQuery() {
+    const q = nlQuery.trim();
     if (!q) return;
-
+    setError("");
     try {
-      setStatus("Running query...");
-      pushHistory();
+      // Save previous state so the user can undo / go back.
+      pushHistory(filters);
 
-      const res = await fetch(`${API_BASE}/api/nl_query`, {
+      // Use the end-to-end endpoint so the flow is:
+      // NL query -> HF extraction -> backend filtering -> Three.js highlight.
+      const r = await fetch(`${API_BASE}/api/nl_query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q }),
+        body: JSON.stringify({ query: q, existing_filters: filters }),
       });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j?.error || "LLM query failed");
 
-      if (!res.ok) throw new Error(`Query failed: ${res.status}`);
-      const data = await res.json();
-
-      // Expect: { filters, matched_ids, count }
-      setActiveFilters(Array.isArray(data.filters) ? data.filters : (data.filters ? [data.filters] : []));
-      setMatchedIds(asSet(data.matched_ids));
-      setStatus(`Matched ${data.count ?? (data.matched_ids?.length ?? 0)} buildings`);
+      // server returns: { filter, filters, matched_ids, count }
+      const nextFilters = Array.isArray(j.filters) ? j.filters : [...filters, j.filter];
+      skipNextApplyRef.current = true;
+      setFilters(nextFilters);
+      setMatchedIds(new Set(j.matched_ids || []));
+      setNlQuery("");
     } catch (e) {
-      console.error(e);
-      setStatus(String(e?.message || e));
+      setError(String(e.message || e));
     }
-  };
+  }
 
-  // ---------- Save project ----------
-  const saveProject = async () => {
-    const u = username.trim();
+  async function saveProject() {
     const name = projectName.trim();
-    if (!u || !name) {
-      setStatus("Enter a username + project name.");
-      return;
-    }
-    if (!activeFilters?.length) {
-      setStatus("No active filters to save yet.");
-      return;
-    }
+    const user = username.trim();
+    if (!user) return setError("Enter a username first.");
+    if (!name) return setError("Enter a project name.");
 
+    setError("");
     try {
-      setStatus("Saving...");
-      const res = await fetch(`${API_BASE}/api/save`, {
+      const r = await fetch(`${API_BASE}/api/save`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          username: u,
-          name,
-          filters: activeFilters,
-        }),
+        body: JSON.stringify({ username: user, name, filters }),
       });
-
-      if (!res.ok) throw new Error(`Save failed: ${res.status}`);
-      setStatus("Saved!");
-
-      // refresh list
-      const listRes = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(u)}`);
-      if (listRes.ok) {
-        const data = await listRes.json();
-        const list = Array.isArray(data) ? data : (data.projects || []);
-        setProjects(list);
-      }
+      const j = await r.json();
+      if (!r.ok) throw new Error(j?.error || "Save failed");
+      setProjectName("");
+      await refreshProjects(user);
     } catch (e) {
-      console.error(e);
-      setStatus(String(e?.message || e));
+      setError(String(e.message || e));
     }
-  };
+  }
 
-  // ---------- Load project (fix: actually applies saved filters + highlights) ----------
-  const loadProject = async (proj) => {
-    const u = username.trim();
-    if (!u) {
-      setStatus("Enter a username first.");
-      return;
-    }
+  async function loadProject(p) {
+    const user = username.trim();
+    if (!user) return setError("Enter a username first.");
 
-    // proj might be a string or an object like {name: "..."}
-    const name = typeof proj === "string" ? proj : (proj?.name || proj?.project_name || "");
-    if (!name) return;
+    // Save current state so the user can go back.
+    pushHistory(filters);
 
     try {
-      setStatus("Loading project...");
-      pushHistory();
-
-      const res = await fetch(`${API_BASE}/api/load`, {
+      // Use a dedicated backend endpoint that returns BOTH:
+      // - the saved filters
+      // - the matching building ids (so the 3D highlight updates immediately)
+      const r = await fetch(`${API_BASE}/api/load`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: u, name }),
+        body: JSON.stringify({ username: user, name: p?.name }),
       });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j?.error || "Load failed");
 
-      if (!res.ok) throw new Error(`Load failed: ${res.status}`);
-      const data = await res.json();
-
-      // Expect: { filters, matched_ids, count }
-      setActiveFilters(Array.isArray(data.filters) ? data.filters : (data.filters ? [data.filters] : []));
-      setMatchedIds(asSet(data.matched_ids));
-      setStatus(`Loaded "${name}" (${data.count ?? (data.matched_ids?.length ?? 0)} matches)`);
+      const loaded = Array.isArray(j.filters) ? j.filters : [];
+      skipNextApplyRef.current = true; // we already have matched_ids
+      setFilters(loaded);
+      setMatchedIds(new Set(j.matched_ids || []));
     } catch (e) {
-      console.error(e);
-      setStatus(String(e?.message || e));
+      setError(String(e.message || e));
     }
-  };
+  }
 
-  // ---------- Clear ----------
-  const clearAll = () => {
-    pushHistory();
-    setActiveFilters([]);
-    setMatchedIds(new Set());
-    setStatus("Cleared.");
-  };
+  function removeFilter(idx) {
+    pushHistory(filters);
+    setFilters((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  const ui = useMemo(() => {
+    return {
+      loading,
+      error,
+      count: payload?.count || 0,
+      matched: matchedIds.size,
+    };
+  }, [loading, error, payload, matchedIds]);
 
   return (
-    <div style={{ position: "relative", width: "100vw", height: "100vh", overflow: "hidden" }}>
-      <ThreeMap buildings={buildings} matchedIds={matchedIds} />
-
-      {/* UI Panel */}
+    <div style={{ display: "grid", gridTemplateColumns: "380px 1fr", height: "100vh" }}>
+      {/* Sidebar */}
       <div
         style={{
-          position: "absolute",
-          top: 16,
-          left: 16,
-          width: 420,
-          background: "rgba(255,255,255,0.92)",
-          border: "1px solid #e5e5e5",
-          borderRadius: 14,
-          padding: 14,
-          boxShadow: "0 12px 30px rgba(0,0,0,0.12)",
+          borderRight: "1px solid #e5e5e5",
+          padding: 16,
           fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+          overflow: "auto",
         }}
       >
-        <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 10 }}>
-          Calgary 3D Dashboard
+        <h2 style={{ margin: "0 0 8px 0" }}>Calgary 3D City Dashboard</h2>
+        <div style={{ fontSize: 13, color: "#555", marginBottom: 12 }}>
+          Buildings loaded: <b>{ui.count}</b> &nbsp; | &nbsp; Highlighted: <b>{ui.matched}</b>
         </div>
 
-        {/* NL Query */}
-        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        {ui.loading && <div>Loading buildings…</div>}
+        {ui.error && (
+          <div style={{ background: "#fff3f3", border: "1px solid #ffd0d0", padding: 10, borderRadius: 8 }}>
+            <b>Error:</b> {ui.error}
+          </div>
+        )}
+
+        <hr style={{ margin: "16px 0" }} />
+
+        <h3 style={{ margin: "0 0 8px 0" }}>LLM Query</h3>
+        <div style={{ display: "flex", gap: 8 }}>
           <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder='Try: "highlight buildings over 100 feet"'
-            style={{
-              flex: 1,
-              padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-              outline: "none",
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") runQuery();
-            }}
+            value={nlQuery}
+            onChange={(e) => setNlQuery(e.target.value)}
+            placeholder='e.g. "highlight buildings over 30"'
+            style={{ flex: 1, padding: 10, borderRadius: 8, border: "1px solid #ddd" }}
           />
           <button
-            onClick={runQuery}
-            style={{
-              padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-              background: "white",
-              cursor: "pointer",
-              fontWeight: 700,
-            }}
+            onClick={runLLMQuery}
+            style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
           >
             Run
           </button>
         </div>
-
-        {/* Actions */}
-        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-          <button
-            onClick={handleBack}
-            disabled={history.length === 0}
-            style={{
-              padding: "9px 10px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-              background: history.length ? "white" : "#f3f3f3",
-              cursor: history.length ? "pointer" : "not-allowed",
-              fontWeight: 700,
-              flex: 1,
-            }}
-          >
-            Back
-          </button>
-
-          <button
-            onClick={clearAll}
-            style={{
-              padding: "9px 10px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-              background: "white",
-              cursor: "pointer",
-              fontWeight: 700,
-              flex: 1,
-            }}
-          >
-            Clear
-          </button>
+        <div style={{ fontSize: 12, color: "#666", marginTop: 8 }}>
+          Try: <i>"show buildings in RC-G zoning"</i>, <i>"show buildings less than $500,000"</i>
         </div>
 
-        {/* Active Filters */}
-        <div style={{ marginBottom: 10 }}>
-          <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 6 }}>
-            Active Filters <span style={{ fontWeight: 600, color: "#666" }}>({matchedCount} matches)</span>
-          </div>
-          <div
-            style={{
-              maxHeight: 120,
-              overflow: "auto",
-              background: "#fafafa",
-              border: "1px solid #eee",
-              borderRadius: 10,
-              padding: 10,
-              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-              fontSize: 12,
-              whiteSpace: "pre-wrap",
-            }}
-          >
-            {activeFilters?.length ? JSON.stringify(activeFilters, null, 2) : "—"}
-          </div>
-        </div>
-
-        {/* Project Persistence */}
-        <div style={{ marginBottom: 10 }}>
-          <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 8 }}>Projects</div>
-
-          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-            <input
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder="Username"
-              style={{
-                flex: 1,
-                padding: "9px 10px",
-                borderRadius: 10,
-                border: "1px solid #ddd",
-                outline: "none",
+        <h3 style={{ margin: "16px 0 8px 0" }}>Active Filters</h3>
+        {filters.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#777" }}>No filters yet.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {filters.map((f, i) => (
+              <div
+                key={i}
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 8,
+                  padding: 10,
+                  border: "1px solid #eee",
+                  borderRadius: 8,
+                }}
+              >
+                <div style={{ fontSize: 13 }}>{prettyFilter(f)}</div>
+                <button
+                  onClick={() => removeFilter(i)}
+                  style={{ border: "none", background: "transparent", cursor: "pointer", color: "#b00" }}
+                  title="Remove"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            {filtersHistory.length > 0 && (
+              <button
+                onClick={goBack}
+                style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+              >
+                Back
+              </button>
+            )}
+            <button
+              onClick={() => {
+                pushHistory(filters);
+                setFilters([]);
               }}
-            />
+              style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+            >
+              Clear All
+            </button>
+          </div>
+        )}
+
+        <hr style={{ margin: "16px 0" }} />
+
+        <h3 style={{ margin: "0 0 8px 0" }}>Save / Load Analysis</h3>
+        <div style={{ display: "grid", gap: 8 }}>
+          <input
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="Username (no auth required)"
+            style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd" }}
+          />
+          <div style={{ display: "flex", gap: 8 }}>
             <input
               value={projectName}
               onChange={(e) => setProjectName(e.target.value)}
               placeholder="Project name"
-              style={{
-                flex: 1,
-                padding: "9px 10px",
-                borderRadius: 10,
-                border: "1px solid #ddd",
-                outline: "none",
-              }}
+              style={{ flex: 1, padding: 10, borderRadius: 8, border: "1px solid #ddd" }}
             />
             <button
               onClick={saveProject}
-              style={{
-                padding: "9px 10px",
-                borderRadius: 10,
-                border: "1px solid #ddd",
-                background: "white",
-                cursor: "pointer",
-                fontWeight: 800,
-              }}
+              style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
             >
               Save
             </button>
           </div>
-
-          <div
-            style={{
-              border: "1px solid #eee",
-              borderRadius: 10,
-              padding: 10,
-              background: "#fff",
-              maxHeight: 140,
-              overflow: "auto",
-            }}
-          >
-            {!username ? (
-              <div style={{ color: "#666", fontSize: 12 }}>Enter a username to see saved projects.</div>
-            ) : projects?.length ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {projects.map((p, idx) => {
-                  const name = typeof p === "string" ? p : (p.name || p.project_name || `Project ${idx + 1}`);
-                  return (
-                    <button
-                      key={`${name}-${idx}`}
-                      onClick={() => loadProject(p)}
-                      style={{
-                        textAlign: "left",
-                        padding: "8px 10px",
-                        borderRadius: 10,
-                        border: "1px solid #eee",
-                        background: "white",
-                        cursor: "pointer",
-                        fontWeight: 700,
-                      }}
-                    >
-                      {name}
-                    </button>
-                  );
-                })}
-              </div>
-            ) : (
-              <div style={{ color: "#666", fontSize: 12 }}>No saved projects yet.</div>
-            )}
-          </div>
         </div>
 
-        {/* Status */}
-        {status && (
-          <div style={{ fontSize: 12, color: "#444" }}>
-            {status}
+        <h4 style={{ margin: "16px 0 8px 0" }}>Saved Projects</h4>
+        {projects.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#777" }}>No saved projects for this user.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {projects.map((p, idx) => (
+              <button
+                key={idx}
+                onClick={() => loadProject(p)}
+                style={{
+                  textAlign: "left",
+                  padding: 10,
+                  borderRadius: 8,
+                  border: "1px solid #eee",
+                  cursor: "pointer",
+                  background: "white",
+                }}
+                title="Load project"
+              >
+                <b>{p.name}</b>
+                <div style={{ fontSize: 12, color: "#666" }}>
+                  {Array.isArray(p.filters) ? p.filters.map(prettyFilter).join(" | ") : "(invalid filters)"}
+                </div>
+              </button>
+            ))}
           </div>
         )}
+
+        <hr style={{ margin: "16px 0" }} />
+        <button
+          onClick={loadBuildings}
+          style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+        >
+          Refresh Buildings
+        </button>
+        <div style={{ fontSize: 12, color: "#666", marginTop: 8 }}>
+          API: <code>{API_BASE}</code>
+        </div>
+      </div>
+
+      {/* 3D View */}
+      <div style={{ position: "relative" }}>
+        <ThreeMap buildings={buildings} matchedIds={matchedIds} />
       </div>
     </div>
   );
