@@ -20,6 +20,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
   const meshesRef = useRef([]);
+
   // Allow selecting multiple buildings (Shift+Click to add/remove).
   // The info panel shows the last clicked building.
   const [selectedIds, setSelectedIds] = useState(() => new Set());
@@ -27,7 +28,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
 
   // tune these
   const HEIGHT_SCALE = 1.0; // now that coords are meters, start at 1.0
-  const MIN_HEIGHT = 8;     // meters
+  const MIN_HEIGHT = 8; // meters
 
   const mats = useMemo(() => {
     // Procedural "window" texture so extruded polygons read as actual buildings.
@@ -61,7 +62,9 @@ export default function ThreeMap({ buildings, matchedIds }) {
         for (let x = padX; x < canvas.width - padX; x += winW + gapX) {
           // randomize lit windows
           const lit = Math.random() < 0.18;
-          ctx.fillStyle = lit ? "rgba(255, 244, 214, 0.85)" : "rgba(30, 36, 44, 0.55)";
+          ctx.fillStyle = lit
+            ? "rgba(255, 244, 214, 0.85)"
+            : "rgba(30, 36, 44, 0.55)";
           ctx.fillRect(x, y, winW, winH);
         }
       }
@@ -121,8 +124,16 @@ export default function ThreeMap({ buildings, matchedIds }) {
       base: [roofBase, roofBase, wallBase],
       match: [roofMatch, roofMatch, wallMatch],
       selected: [roofSelected, roofSelected, wallSelected],
-      ground: new THREE.MeshStandardMaterial({ color: 0xf3f3f3, roughness: 1.0, metalness: 0.0 }),
-      edge: new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.16 }),
+      ground: new THREE.MeshStandardMaterial({
+        color: 0xf3f3f3,
+        roughness: 1.0,
+        metalness: 0.0,
+      }),
+      edge: new THREE.LineBasicMaterial({
+        color: 0x000000,
+        transparent: true,
+        opacity: 0.16,
+      }),
     };
   }, []);
 
@@ -212,13 +223,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
     fill.position.set(-900, 1200, 900);
     scene.add(fill);
 
-    // subtle ground grid to help the scene read as a city/map
-    const grid = new THREE.GridHelper(8000, 80, 0x9aa0a6, 0x9aa0a6);
-    grid.material.transparent = true;
-    grid.material.opacity = 0.12;
-    grid.position.set(0, 0, 0.01);
-    scene.add(grid);
-
     // controls
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
@@ -232,18 +236,19 @@ export default function ThreeMap({ buildings, matchedIds }) {
     scene.add(group);
 
     // ----- Convert buildings to meters + choose a consistent origin -----
-    // Use bbox center from your data if available, otherwise center of first building.
     let originMx = 0;
     let originMy = 0;
 
-    const first = buildings?.find((b) => Array.isArray(b?.footprint_ll) && b.footprint_ll.length > 2);
+    const first = buildings?.find(
+      (b) => Array.isArray(b?.footprint_ll) && b.footprint_ll.length > 2
+    );
     if (first) {
       const [lon0, lat0] = first.footprint_ll[0];
       [originMx, originMy] = lonLatToMercatorMeters(Number(lon0), Number(lat0));
     }
 
     // Build meshes
-    buildings.forEach((b, i) => {
+    buildings.forEach((b) => {
       const ll = b.footprint_ll; // ✅ use lon/lat from API
       if (!Array.isArray(ll) || ll.length < 3) return;
 
@@ -258,7 +263,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
       const rawH = Number(b.height) || 10;
       const h = Math.max(MIN_HEIGHT, rawH * HEIGHT_SCALE);
 
-      // Extrude in +Z, then rotate so Z is up and polygon sits on ground plane.
       const geo = new THREE.ExtrudeGeometry(shape, {
         depth: h,
         bevelEnabled: false,
@@ -289,18 +293,31 @@ export default function ThreeMap({ buildings, matchedIds }) {
     box.getCenter(center);
 
     const groundSize = Math.max(size.x, size.y) * 1.6 || 2500;
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), mats.ground);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(groundSize, groundSize),
+      mats.ground
+    );
     ground.rotation.x = -Math.PI / 2;
     ground.position.set(center.x, center.y, 0);
     ground.receiveShadow = true;
     scene.add(ground);
 
-    // Subtle grid to help the scene read as a city/map surface
-    const grid = new THREE.GridHelper(groundSize, 80, 0x000000, 0x000000);
-    grid.position.set(center.x, center.y, 0.01);
-    grid.material.transparent = true;
-    grid.material.opacity = 0.06;
-    scene.add(grid);
+    // ✅ FIX: only ONE grid, and it’s sized/positioned to the dataset
+    const gridHelper = new THREE.GridHelper(groundSize, 80, 0x000000, 0x000000);
+    gridHelper.position.set(center.x, center.y, 0.01);
+
+    // GridHelper material may be a single material or an array
+    if (Array.isArray(gridHelper.material)) {
+      gridHelper.material.forEach((m) => {
+        m.transparent = true;
+        m.opacity = 0.06;
+      });
+    } else {
+      gridHelper.material.transparent = true;
+      gridHelper.material.opacity = 0.06;
+    }
+    scene.add(gridHelper);
 
     // Fit camera
     const maxDim = Math.max(size.x, size.y, size.z) || 400;
@@ -308,7 +325,11 @@ export default function ThreeMap({ buildings, matchedIds }) {
 
     camera.near = 0.1;
     camera.far = maxDim * 40 + 10000;
-    camera.position.set(center.x + maxDim * 0.9, center.y - maxDim * 1.4, center.z + maxDim * 0.8);
+    camera.position.set(
+      center.x + maxDim * 0.9,
+      center.y - maxDim * 1.4,
+      center.z + maxDim * 0.8
+    );
     camera.updateProjectionMatrix();
 
     // selection/highlight
@@ -340,7 +361,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
         setSelectedIds((prev) => {
           const next = new Set(prev);
           if (ev.shiftKey) {
-            // toggle
             if (next.has(bid)) next.delete(bid);
             else next.add(bid);
           } else {
@@ -351,7 +371,11 @@ export default function ThreeMap({ buildings, matchedIds }) {
           return next;
         });
 
-        setSelectedInfo({ building, x: ev.clientX - rect.left + 8, y: ev.clientY - rect.top + 8 });
+        setSelectedInfo({
+          building,
+          x: ev.clientX - rect.left + 8,
+          y: ev.clientY - rect.top + 8,
+        });
       } else {
         const empty = new Set();
         applyMaterials(empty);
@@ -388,6 +412,9 @@ export default function ThreeMap({ buildings, matchedIds }) {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", handleResize);
       renderer.domElement.removeEventListener("click", handleClick);
+
+      // optional: remove renderer canvas
+      renderer.domElement?.remove();
       renderer.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -425,10 +452,18 @@ export default function ThreeMap({ buildings, matchedIds }) {
           }}
         >
           <div style={{ fontWeight: 800, marginBottom: 8 }}>Building</div>
-          <div style={{ marginBottom: 6 }}><b>Address:</b> {safeLabel(selectedInfo.building.address)}</div>
-          <div style={{ marginBottom: 6 }}><b>Height:</b> {safeLabel(selectedInfo.building.height)}</div>
-          <div style={{ marginBottom: 6 }}><b>Zoning:</b> {safeLabel(selectedInfo.building.zoning)}</div>
-          <div style={{ marginBottom: 10 }}><b>Assessed Value:</b> {safeLabel(selectedInfo.building.assessed_value)}</div>
+          <div style={{ marginBottom: 6 }}>
+            <b>Address:</b> {safeLabel(selectedInfo.building.address)}
+          </div>
+          <div style={{ marginBottom: 6 }}>
+            <b>Height:</b> {safeLabel(selectedInfo.building.height)}
+          </div>
+          <div style={{ marginBottom: 6 }}>
+            <b>Zoning:</b> {safeLabel(selectedInfo.building.zoning)}
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <b>Assessed Value:</b> {safeLabel(selectedInfo.building.assessed_value)}
+          </div>
 
           <div style={{ marginBottom: 10, color: "#555", fontSize: 12 }}>
             Selected: <b>{selectedIds.size}</b> (Shift+Click to multi-select)
@@ -443,7 +478,8 @@ export default function ThreeMap({ buildings, matchedIds }) {
               border: "1px solid #eee",
               borderRadius: 8,
               padding: 8,
-              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+              fontFamily:
+                "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
               fontSize: 11,
             }}
           >
