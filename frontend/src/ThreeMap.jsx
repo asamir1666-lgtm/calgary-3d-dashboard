@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 
 function safeLabel(v) {
   if (v === null || v === undefined || v === "") return "—";
@@ -29,10 +30,97 @@ export default function ThreeMap({ buildings, matchedIds }) {
   const MIN_HEIGHT = 8;     // meters
 
   const mats = useMemo(() => {
+    // Procedural "window" texture so extruded polygons read as actual buildings.
+    const makeFacadeTexture = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 256;
+      canvas.height = 512;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+
+      // base facade
+      ctx.fillStyle = "#7b7f86";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // subtle vertical variation
+      for (let x = 0; x < canvas.width; x += 8) {
+        const t = (x / canvas.width) * 0.12;
+        ctx.fillStyle = `rgba(255,255,255,${t})`;
+        ctx.fillRect(x, 0, 1, canvas.height);
+      }
+
+      // windows grid
+      const padX = 18;
+      const padY = 18;
+      const winW = 14;
+      const winH = 18;
+      const gapX = 10;
+      const gapY = 14;
+
+      for (let y = padY; y < canvas.height - padY; y += winH + gapY) {
+        for (let x = padX; x < canvas.width - padX; x += winW + gapX) {
+          // randomize lit windows
+          const lit = Math.random() < 0.18;
+          ctx.fillStyle = lit ? "rgba(255, 244, 214, 0.85)" : "rgba(30, 36, 44, 0.55)";
+          ctx.fillRect(x, y, winW, winH);
+        }
+      }
+
+      // horizontal bands
+      ctx.fillStyle = "rgba(0,0,0,0.08)";
+      for (let y = 0; y < canvas.height; y += 64) {
+        ctx.fillRect(0, y, canvas.width, 2);
+      }
+
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(1.2, 1.0);
+      tex.anisotropy = 8;
+      tex.needsUpdate = true;
+      return tex;
+    };
+
+    const facadeTex = makeFacadeTexture();
+
+    // Separate wall/roof materials for a more "real building" look.
+    const wallBase = new THREE.MeshStandardMaterial({
+      map: facadeTex || null,
+      color: 0x9aa0a6,
+      roughness: 0.92,
+      metalness: 0.02,
+      emissive: 0x000000,
+      emissiveIntensity: 0.25,
+    });
+    const roofBase = new THREE.MeshStandardMaterial({
+      color: 0x6f747c,
+      roughness: 0.95,
+      metalness: 0.02,
+    });
+
+    // For match/selected: keep texture but tint + boost emissive so it reads as a highlight.
+    const wallMatch = wallBase.clone();
+    wallMatch.color = new THREE.Color(0xd93025);
+    wallMatch.emissive = new THREE.Color(0x6b1a16);
+    wallMatch.emissiveIntensity = 0.55;
+
+    const roofMatch = roofBase.clone();
+    roofMatch.color = new THREE.Color(0xb3261e);
+
+    const wallSelected = wallBase.clone();
+    wallSelected.color = new THREE.Color(0x1a73e8);
+    wallSelected.emissive = new THREE.Color(0x0b2a66);
+    wallSelected.emissiveIntensity = 0.6;
+
+    const roofSelected = roofBase.clone();
+    roofSelected.color = new THREE.Color(0x1558b0);
+
     return {
-      base: new THREE.MeshStandardMaterial({ color: 0xa3a7ad, roughness: 0.85, metalness: 0.02 }),
-      match: new THREE.MeshStandardMaterial({ color: 0xd93025, roughness: 0.75, metalness: 0.02 }),
-      selected: new THREE.MeshStandardMaterial({ color: 0x1a73e8, roughness: 0.65, metalness: 0.05 }),
+      // ExtrudeGeometry makes 3 groups (front/back/sides). Use material arrays so roofs differ from walls.
+      base: [roofBase, roofBase, wallBase],
+      match: [roofMatch, roofMatch, wallMatch],
+      selected: [roofSelected, roofSelected, wallSelected],
       ground: new THREE.MeshStandardMaterial({ color: 0xf3f3f3, roughness: 1.0, metalness: 0.0 }),
       edge: new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.16 }),
     };
@@ -95,6 +183,11 @@ export default function ThreeMap({ buildings, matchedIds }) {
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
+    // ✅ environment lighting for more realistic materials
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    pmrem.dispose();
+
     mountRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -118,6 +211,13 @@ export default function ThreeMap({ buildings, matchedIds }) {
     const fill = new THREE.DirectionalLight(0xffffff, 0.25);
     fill.position.set(-900, 1200, 900);
     scene.add(fill);
+
+    // subtle ground grid to help the scene read as a city/map
+    const grid = new THREE.GridHelper(8000, 80, 0x9aa0a6, 0x9aa0a6);
+    grid.material.transparent = true;
+    grid.material.opacity = 0.12;
+    grid.position.set(0, 0, 0.01);
+    scene.add(grid);
 
     // controls
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -194,6 +294,13 @@ export default function ThreeMap({ buildings, matchedIds }) {
     ground.position.set(center.x, center.y, 0);
     ground.receiveShadow = true;
     scene.add(ground);
+
+    // Subtle grid to help the scene read as a city/map surface
+    const grid = new THREE.GridHelper(groundSize, 80, 0x000000, 0x000000);
+    grid.position.set(center.x, center.y, 0.01);
+    grid.material.transparent = true;
+    grid.material.opacity = 0.06;
+    scene.add(grid);
 
     // Fit camera
     const maxDim = Math.max(size.x, size.y, size.z) || 400;

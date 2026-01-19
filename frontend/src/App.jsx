@@ -153,14 +153,32 @@ export default function App() {
     }
   }
 
-  function loadProject(p) {
-    const loaded = Array.isArray(p.filters) ? p.filters : [];
-    // Ensure we immediately re-apply highlights when loading a saved project.
-    // (Avoid edge-cases where an in-flight LLM update could cause a skipped apply.)
+  async function loadProject(p) {
+    const user = username.trim();
+    if (!user) return setError("Enter a username first.");
+
+    // Save current state so the user can go back.
     pushHistory(filters);
-    skipNextApplyRef.current = false;
-    setFilters(loaded);
-    applyFilters(loaded);
+
+    try {
+      // Use a dedicated backend endpoint that returns BOTH:
+      // - the saved filters
+      // - the matching building ids (so the 3D highlight updates immediately)
+      const r = await fetch(`${API_BASE}/api/load`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: user, name: p?.name }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j?.error || "Load failed");
+
+      const loaded = Array.isArray(j.filters) ? j.filters : [];
+      skipNextApplyRef.current = true; // we already have matched_ids
+      setFilters(loaded);
+      setMatchedIds(new Set(j.matched_ids || []));
+    } catch (e) {
+      setError(String(e.message || e));
+    }
   }
 
   function removeFilter(idx) {
