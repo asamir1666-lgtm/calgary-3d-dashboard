@@ -18,8 +18,28 @@ export default function App() {
   const [projects, setProjects] = useState([]);
   const [nlQuery, setNlQuery] = useState("");
   const [filters, setFilters] = useState([]);
+  const [filtersHistory, setFiltersHistory] = useState([]);
   const [matchedIds, setMatchedIds] = useState(new Set());
   const skipNextApplyRef = useRef(false);
+
+  function pushHistory(snapshot) {
+    setFiltersHistory((h) => {
+      const next = [...h, snapshot];
+      // keep it bounded so it doesn't grow forever
+      return next.slice(-20);
+    });
+  }
+
+  function goBack() {
+    setFiltersHistory((h) => {
+      if (h.length === 0) return h;
+      const prev = h[h.length - 1];
+      skipNextApplyRef.current = false;
+      setFilters(prev);
+      applyFilters(prev);
+      return h.slice(0, -1);
+    });
+  }
 
   const buildings = payload?.buildings || [];
 
@@ -87,6 +107,9 @@ export default function App() {
     if (!q) return;
     setError("");
     try {
+      // Save previous state so the user can undo / go back.
+      pushHistory(filters);
+
       // Use the end-to-end endpoint so the flow is:
       // NL query -> HF extraction -> backend filtering -> Three.js highlight.
       const r = await fetch(`${API_BASE}/api/nl_query`, {
@@ -132,10 +155,16 @@ export default function App() {
 
   function loadProject(p) {
     const loaded = Array.isArray(p.filters) ? p.filters : [];
+    // Ensure we immediately re-apply highlights when loading a saved project.
+    // (Avoid edge-cases where an in-flight LLM update could cause a skipped apply.)
+    pushHistory(filters);
+    skipNextApplyRef.current = false;
     setFilters(loaded);
+    applyFilters(loaded);
   }
 
   function removeFilter(idx) {
+    pushHistory(filters);
     setFilters((prev) => prev.filter((_, i) => i !== idx));
   }
 
@@ -219,8 +248,19 @@ export default function App() {
                 </button>
               </div>
             ))}
+            {filtersHistory.length > 0 && (
+              <button
+                onClick={goBack}
+                style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+              >
+                Back
+              </button>
+            )}
             <button
-              onClick={() => setFilters([])}
+              onClick={() => {
+                pushHistory(filters);
+                setFilters([]);
+              }}
               style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
             >
               Clear All

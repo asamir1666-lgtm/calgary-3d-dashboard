@@ -19,7 +19,10 @@ export default function ThreeMap({ buildings, matchedIds }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
   const meshesRef = useRef([]);
-  const [selected, setSelected] = useState(null);
+  // Allow selecting multiple buildings (Shift+Click to add/remove).
+  // The info panel shows the last clicked building.
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [selectedInfo, setSelectedInfo] = useState(null);
 
   // tune these
   const HEIGHT_SCALE = 1.0; // now that coords are meters, start at 1.0
@@ -67,7 +70,8 @@ export default function ThreeMap({ buildings, matchedIds }) {
       rendererRef.current.dispose();
     }
     meshesRef.current = [];
-    setSelected(null);
+    setSelectedIds(new Set());
+    setSelectedInfo(null);
 
     const width = mountRef.current.clientWidth;
     const height = mountRef.current.clientHeight;
@@ -201,11 +205,11 @@ export default function ThreeMap({ buildings, matchedIds }) {
     camera.updateProjectionMatrix();
 
     // selection/highlight
-    const applyMaterials = (selectedId) => {
+    const applyMaterials = (selIds) => {
       meshesRef.current.forEach((m) => {
         const bid = m.userData.building?.id;
         const isMatch = matchedIds?.has?.(bid);
-        const isSel = selectedId && bid === selectedId;
+        const isSel = selIds?.has?.(bid);
         m.material = isSel ? mats.selected : isMatch ? mats.match : mats.base;
       });
     };
@@ -224,11 +228,28 @@ export default function ThreeMap({ buildings, matchedIds }) {
 
       if (hits.length > 0) {
         const building = hits[0].object.userData.building;
-        applyMaterials(building.id);
-        setSelected({ building, x: ev.clientX - rect.left + 8, y: ev.clientY - rect.top + 8 });
+        const bid = building?.id;
+
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          if (ev.shiftKey) {
+            // toggle
+            if (next.has(bid)) next.delete(bid);
+            else next.add(bid);
+          } else {
+            next.clear();
+            next.add(bid);
+          }
+          applyMaterials(next);
+          return next;
+        });
+
+        setSelectedInfo({ building, x: ev.clientX - rect.left + 8, y: ev.clientY - rect.top + 8 });
       } else {
-        applyMaterials(null);
-        setSelected(null);
+        const empty = new Set();
+        applyMaterials(empty);
+        setSelectedIds(empty);
+        setSelectedInfo(null);
       }
     };
 
@@ -254,7 +275,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
     };
     animate();
 
-    applyMaterials(null);
+    applyMaterials(new Set());
 
     return () => {
       cancelAnimationFrame(raf);
@@ -269,22 +290,22 @@ export default function ThreeMap({ buildings, matchedIds }) {
   useEffect(() => {
     meshesRef.current.forEach((m) => {
       const bid = m.userData.building?.id;
-      const isSelected = selected?.building?.id === bid;
+      const isSelected = selectedIds?.has?.(bid);
       const isMatch = matchedIds?.has?.(bid);
       m.material = isSelected ? mats.selected : isMatch ? mats.match : mats.base;
     });
-  }, [matchedIds, selected, mats]);
+  }, [matchedIds, selectedIds, mats]);
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
       <div ref={mountRef} style={{ position: "absolute", inset: 0 }} />
 
-      {selected && (
+      {selectedInfo && (
         <div
           style={{
             position: "absolute",
-            left: selected.x,
-            top: selected.y,
+            left: selectedInfo.x,
+            top: selectedInfo.y,
             background: "white",
             border: "1px solid #ddd",
             borderRadius: 12,
@@ -297,10 +318,14 @@ export default function ThreeMap({ buildings, matchedIds }) {
           }}
         >
           <div style={{ fontWeight: 800, marginBottom: 8 }}>Building</div>
-          <div style={{ marginBottom: 6 }}><b>Address:</b> {safeLabel(selected.building.address)}</div>
-          <div style={{ marginBottom: 6 }}><b>Height:</b> {safeLabel(selected.building.height)}</div>
-          <div style={{ marginBottom: 6 }}><b>Zoning:</b> {safeLabel(selected.building.zoning)}</div>
-          <div style={{ marginBottom: 10 }}><b>Assessed Value:</b> {safeLabel(selected.building.assessed_value)}</div>
+          <div style={{ marginBottom: 6 }}><b>Address:</b> {safeLabel(selectedInfo.building.address)}</div>
+          <div style={{ marginBottom: 6 }}><b>Height:</b> {safeLabel(selectedInfo.building.height)}</div>
+          <div style={{ marginBottom: 6 }}><b>Zoning:</b> {safeLabel(selectedInfo.building.zoning)}</div>
+          <div style={{ marginBottom: 10 }}><b>Assessed Value:</b> {safeLabel(selectedInfo.building.assessed_value)}</div>
+
+          <div style={{ marginBottom: 10, color: "#555", fontSize: 12 }}>
+            Selected: <b>{selectedIds.size}</b> (Shift+Click to multi-select)
+          </div>
 
           <div style={{ fontWeight: 800, marginBottom: 6 }}>Raw data</div>
           <div
@@ -315,7 +340,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
               fontSize: 11,
             }}
           >
-            {JSON.stringify(selected.building.properties || {}, null, 2)}
+            {JSON.stringify(selectedInfo.building.properties || {}, null, 2)}
           </div>
         </div>
       )}
