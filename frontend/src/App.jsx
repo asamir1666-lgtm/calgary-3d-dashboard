@@ -8,16 +8,23 @@ function prettyFilter(f) {
   return `${f.attribute} ${f.operator} ${f.value}`;
 }
 
+// Normalize projects response: can be [] or {projects: []}
 function normalizeProjectsResponse(j) {
   if (Array.isArray(j)) return j;
   if (j && Array.isArray(j.projects)) return j.projects;
   return [];
 }
 
+// Normalize project name key differences
 function getProjectName(p) {
   if (!p) return "";
   if (typeof p === "string") return p;
   return p.name || p.project_name || p.title || "";
+}
+
+// ✅ normalize ids into Numbers (fixes string/number mismatch)
+function normalizeIdSet(arr) {
+  return new Set((arr || []).map((x) => (x === null || x === undefined ? x : Number(x))));
 }
 
 export default function App() {
@@ -25,25 +32,33 @@ export default function App() {
   const [error, setError] = useState("");
   const [payload, setPayload] = useState(null);
 
+  // UI state
   const [username, setUsername] = useState("ali");
   const [projectName, setProjectName] = useState("");
   const [projects, setProjects] = useState([]);
 
+  const [activeProjectName, setActiveProjectName] = useState(""); // ✅ NEW (shows active)
+
   const [nlQuery, setNlQuery] = useState("");
   const [filters, setFilters] = useState([]);
+
+  // ✅ history stores filters + matched ids + selected building
   const [history, setHistory] = useState([]);
+
   const [matchedIds, setMatchedIds] = useState(new Set());
 
-  // ✅ NEW: store selected building
+  // ✅ store selected building
   const [selectedBuildingId, setSelectedBuildingId] = useState(null);
 
-  // ✅ NEW: force map remount to "refresh"
+  // ✅ force map remount to refresh view
   const [mapKey, setMapKey] = useState(0);
 
+  // prevents double-applying when we already have matched_ids from server
   const skipNextApplyRef = useRef(false);
 
   const buildings = payload?.buildings || [];
 
+  // ---------- HISTORY ----------
   function pushHistorySnapshot(snapshot) {
     setHistory((h) => {
       const next = [...h, snapshot];
@@ -56,6 +71,7 @@ export default function App() {
       filters: Array.isArray(filters) ? JSON.parse(JSON.stringify(filters)) : [],
       matched_ids: Array.from(matchedIds || []),
       selected_building_id: selectedBuildingId,
+      active_project_name: activeProjectName,
     });
   }
 
@@ -66,16 +82,16 @@ export default function App() {
 
       skipNextApplyRef.current = true;
       setFilters(prev.filters || []);
-      setMatchedIds(new Set(prev.matched_ids || []));
+      setMatchedIds(normalizeIdSet(prev.matched_ids || []));
       setSelectedBuildingId(prev.selected_building_id ?? null);
+      setActiveProjectName(prev.active_project_name || "");
 
-      // refresh map so selection/highlights re-apply visually
       setMapKey((k) => k + 1);
-
       return h.slice(0, -1);
     });
   }
 
+  // ---------- DATA ----------
   async function loadBuildings() {
     setLoading(true);
     setError("");
@@ -91,6 +107,7 @@ export default function App() {
     }
   }
 
+  // ---------- PROJECTS ----------
   async function refreshProjects(user = username) {
     if (!user) return;
     try {
@@ -103,6 +120,7 @@ export default function App() {
     }
   }
 
+  // ---------- APPLY FILTERS ----------
   async function applyFilters(nextFilters) {
     try {
       const r = await fetch(`${API_BASE}/api/apply_filters`, {
@@ -112,7 +130,9 @@ export default function App() {
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "Failed to apply filters");
-      setMatchedIds(new Set(j.matched_ids || []));
+
+      // ✅ normalize id types so Set matches building.id
+      setMatchedIds(normalizeIdSet(j.matched_ids || []));
     } catch (e) {
       console.warn(e);
     }
@@ -124,8 +144,18 @@ export default function App() {
 
   useEffect(() => {
     refreshProjects(username);
+
+    // changing username should reset active project + selection
+    setActiveProjectName("");
+    setSelectedBuildingId(null);
+    setFilters([]);
+    setMatchedIds(new Set());
+    setHistory([]);
+    setMapKey((k) => k + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [username]);
 
+  // When filters change, compute highlights (unless we already got matched_ids from server)
   useEffect(() => {
     if (skipNextApplyRef.current) {
       skipNextApplyRef.current = false;
@@ -134,6 +164,7 @@ export default function App() {
     applyFilters(filters);
   }, [filters]);
 
+  // ---------- LLM QUERY ----------
   async function runLLMQuery() {
     const q = nlQuery.trim();
     if (!q) return;
@@ -157,10 +188,14 @@ export default function App() {
         ? [...filters, j.filter]
         : filters;
 
+      // backend may return matched_ids
       skipNextApplyRef.current = true;
       setFilters(nextFilters);
-      setMatchedIds(new Set(j.matched_ids || []));
+      setMatchedIds(normalizeIdSet(j.matched_ids || []));
       setNlQuery("");
+
+      // leaving project mode if you run new analysis
+      setActiveProjectName("");
 
       setMapKey((k) => k + 1);
     } catch (e) {
@@ -168,6 +203,7 @@ export default function App() {
     }
   }
 
+  // ---------- SAVE PROJECT ----------
   async function saveProject() {
     const name = projectName.trim();
     const user = username.trim();
@@ -175,7 +211,6 @@ export default function App() {
     if (!user) return setError("Enter a username first.");
     if (!name) return setError("Enter a project name.");
 
-    // ✅ allow save even if no filters, as long as they selected a building
     if (!filters.length && !selectedBuildingId) {
       return setError("Add filters or select a building before saving.");
     }
@@ -192,7 +227,7 @@ export default function App() {
           name,
           filters,
           matched_ids: Array.from(matchedIds || []),
-          selected_building_id: selectedBuildingId, // ✅ NEW
+          selected_building_id: selectedBuildingId,
         }),
       });
 
@@ -202,13 +237,15 @@ export default function App() {
       setProjectName("");
       await refreshProjects(user);
 
-      // ✅ refresh map after save
+      // ✅ set active + refresh map so it clearly "locked in"
+      setActiveProjectName(name);
       setMapKey((k) => k + 1);
     } catch (e) {
       setError(String(e.message || e));
     }
   }
 
+  // ---------- LOAD PROJECT ----------
   async function loadProject(p) {
     const user = username.trim();
     if (!user) return setError("Enter a username first.");
@@ -231,20 +268,21 @@ export default function App() {
 
       const loadedFilters = Array.isArray(j.filters) ? j.filters : [];
 
-      // ✅ load building selection too
+      setActiveProjectName(name);
       setSelectedBuildingId(j.selected_building_id ?? null);
 
       if (Array.isArray(j.matched_ids)) {
+        // ✅ trust backend matched ids (normalize types)
         skipNextApplyRef.current = true;
         setFilters(loadedFilters);
-        setMatchedIds(new Set(j.matched_ids));
+        setMatchedIds(normalizeIdSet(j.matched_ids));
       } else {
+        // fallback: compute highlights from filters
         skipNextApplyRef.current = true;
         setFilters(loadedFilters);
         await applyFilters(loadedFilters);
       }
 
-      // ✅ force map refresh so camera/selection updates
       setMapKey((k) => k + 1);
     } catch (e) {
       setError(String(e.message || e));
@@ -254,6 +292,7 @@ export default function App() {
   function removeFilter(idx) {
     pushCurrentToHistory();
     setFilters((prev) => prev.filter((_, i) => i !== idx));
+    setActiveProjectName("");
   }
 
   const ui = useMemo(() => {
@@ -267,7 +306,196 @@ export default function App() {
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "380px 1fr", height: "100vh" }}>
-      {/* Sidebar ... unchanged ... */}
+      {/* Sidebar */}
+      <div
+        style={{
+          borderRight: "1px solid #e5e5e5",
+          padding: 16,
+          fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+          overflow: "auto",
+        }}
+      >
+        <h2 style={{ margin: "0 0 8px 0" }}>Calgary 3D City Dashboard</h2>
+
+        <div style={{ fontSize: 13, color: "#555", marginBottom: 12 }}>
+          Buildings loaded: <b>{ui.count}</b> &nbsp; | &nbsp; Highlighted: <b>{ui.matched}</b>
+        </div>
+
+        {activeProjectName ? (
+          <div
+            style={{
+              background: "#e8f0fe",
+              border: "1px solid #c6dafc",
+              padding: 10,
+              borderRadius: 10,
+              fontSize: 13,
+              marginBottom: 12,
+            }}
+          >
+            Active project: <b>{activeProjectName}</b>
+          </div>
+        ) : null}
+
+        {ui.loading && <div>Loading buildings…</div>}
+        {ui.error && (
+          <div
+            style={{
+              background: "#fff3f3",
+              border: "1px solid #ffd0d0",
+              padding: 10,
+              borderRadius: 8,
+            }}
+          >
+            <b>Error:</b> {ui.error}
+          </div>
+        )}
+
+        <hr style={{ margin: "16px 0" }} />
+
+        <h3 style={{ margin: "0 0 8px 0" }}>LLM Query</h3>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={nlQuery}
+            onChange={(e) => setNlQuery(e.target.value)}
+            placeholder='e.g. "highlight buildings over 30"'
+            style={{ flex: 1, padding: 10, borderRadius: 8, border: "1px solid #ddd" }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") runLLMQuery();
+            }}
+          />
+          <button
+            onClick={runLLMQuery}
+            style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+          >
+            Run
+          </button>
+        </div>
+
+        <h3 style={{ margin: "16px 0 8px 0" }}>Active Filters</h3>
+        {filters.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#777" }}>No filters yet.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {filters.map((f, i) => (
+              <div
+                key={i}
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 8,
+                  padding: 10,
+                  border: "1px solid #eee",
+                  borderRadius: 8,
+                }}
+              >
+                <div style={{ fontSize: 13 }}>{prettyFilter(f)}</div>
+                <button
+                  onClick={() => removeFilter(i)}
+                  style={{ border: "none", background: "transparent", cursor: "pointer", color: "#b00" }}
+                  title="Remove"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+
+            {history.length > 0 && (
+              <button
+                onClick={goBack}
+                style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+              >
+                Back
+              </button>
+            )}
+
+            <button
+              onClick={() => {
+                pushCurrentToHistory();
+                setFilters([]);
+                setMatchedIds(new Set());
+                setSelectedBuildingId(null);
+                setActiveProjectName("");
+                setMapKey((k) => k + 1);
+              }}
+              style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+            >
+              Clear All
+            </button>
+          </div>
+        )}
+
+        <hr style={{ margin: "16px 0" }} />
+
+        <h3 style={{ margin: "0 0 8px 0" }}>Save / Load Analysis</h3>
+        <div style={{ display: "grid", gap: 8 }}>
+          <input
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="Username (no auth required)"
+            style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd" }}
+          />
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={projectName}
+              onChange={(e) => setProjectName(e.target.value)}
+              placeholder="Project name"
+              style={{ flex: 1, padding: 10, borderRadius: 8, border: "1px solid #ddd" }}
+            />
+            <button
+              onClick={saveProject}
+              style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+            >
+              Save
+            </button>
+          </div>
+        </div>
+
+        <h4 style={{ margin: "16px 0 8px 0" }}>Saved Projects</h4>
+        {projects.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#777" }}>No saved projects for this user.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {projects.map((p, idx) => {
+              const name = getProjectName(p) || `Project ${idx + 1}`;
+              const savedFilters = Array.isArray(p?.filters) ? p.filters : null;
+              const isActive = name === activeProjectName;
+
+              return (
+                <button
+                  key={`${name}-${idx}`}
+                  onClick={() => loadProject(p)}
+                  style={{
+                    textAlign: "left",
+                    padding: 10,
+                    borderRadius: 8,
+                    border: isActive ? "2px solid #1a73e8" : "1px solid #eee",
+                    cursor: "pointer",
+                    background: isActive ? "#e8f0fe" : "white",
+                  }}
+                  title="Load project"
+                >
+                  <b>{name}</b>
+                  <div style={{ fontSize: 12, color: "#666" }}>
+                    {savedFilters ? savedFilters.map(prettyFilter).join(" | ") : "Saved analysis"}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        <hr style={{ margin: "16px 0" }} />
+        <button
+          onClick={loadBuildings}
+          style={{ padding: 10, borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+        >
+          Refresh Buildings
+        </button>
+        <div style={{ fontSize: 12, color: "#666", marginTop: 8 }}>
+          API: <code>{API_BASE}</code>
+        </div>
+      </div>
 
       {/* 3D View */}
       <div style={{ position: "relative" }}>
