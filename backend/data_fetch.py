@@ -1,15 +1,8 @@
 """Calgary Open Data fetch + normalization (GeoJSON-first, reliable).
 
-Why this version:
-- Some Socrata datasets do NOT include polygon geometry in the plain .json rows.
-- The Socrata GeoJSON endpoint reliably includes geometry in features[].geometry.
-- Calgary "3D Buildings - Citywide" uses projected coordinates (meters), not lon/lat.
-
-What this returns:
-{
-  bbox, projection, window_meters, count,
-  buildings: [{id,height,zoning,assessed_value,address,footprint_ll,footprint_xy,properties}]
-}
+- Uses Socrata GeoJSON endpoint so geometry always exists.
+- Dataset is projected meters.
+- Filters to ~5 blocks via WINDOW_METERS.
 """
 
 from __future__ import annotations
@@ -20,10 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 
-# Use GeoJSON endpoint (most reliable geometry access)
 SOCRATA_GEOJSON_URL = "https://data.calgary.ca/resource/cchr-krqg.geojson"
 
-# Still keep these env vars for compatibility, but dataset is projected (meters)
 DEFAULT_BBOX = {
     "south": float(os.getenv("BBOX_S", "51.046")),
     "west": float(os.getenv("BBOX_W", "-114.071")),
@@ -31,10 +22,9 @@ DEFAULT_BBOX = {
     "east": float(os.getenv("BBOX_E", "-114.065")),
 }
 
-# How many features to fetch from the GeoJSON endpoint
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "8000"))
 
-# ✅ Approx “~5 blocks” window size in meters (smaller than 650)
+# ✅ ~5 blocks
 WINDOW_METERS = float(os.getenv("WINDOW_METERS", "450"))
 
 
@@ -106,17 +96,19 @@ def _choose_projected_window(features: List[Dict[str, Any]]) -> Dict[str, float]
         ring = _extract_ring_coords(geom)
         if ring and len(ring) >= 3:
             x0, y0 = float(ring[0][0]), float(ring[0][1])
-            return {"min_x": x0 - half, "max_x": x0 + half, "min_y": y0 - half, "max_y": y0 + half}
+            return {
+                "min_x": x0 - half,
+                "max_x": x0 + half,
+                "min_y": y0 - half,
+                "max_y": y0 + half,
+            }
     raise RuntimeError("No valid polygon geometries found in GeoJSON features.")
 
 
 def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> Dict[str, Any]:
-    """✅ limit reduced to 200 so you don’t render too many buildings."""
     bbox = bbox or DEFAULT_BBOX
-
     features = _fetch_geojson_features()
 
-    # This dataset is projected meters -> choose a contiguous “~5 blocks” window
     win = _choose_projected_window(features)
     origin_x = (win["min_x"] + win["max_x"]) / 2.0
     origin_y = (win["min_y"] + win["max_y"]) / 2.0
@@ -133,7 +125,6 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> D
         if not _intersects_window(ring, win):
             continue
 
-        # best-effort fields (depend on dataset schema)
         height = (
             _as_float(props.get("height"))
             or _as_float(props.get("bldg_height"))
@@ -141,6 +132,7 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> D
             or _as_float(props.get("max_height"))
             or 10.0
         )
+
         zoning = props.get("zoning") or props.get("land_use") or props.get("zone")
         address = props.get("address") or props.get("street_address") or props.get("full_address")
         assessed_value = (
@@ -149,7 +141,6 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> D
             or _as_float(props.get("value"))
         )
 
-        # In projected meters, geometry coords are already planar. Use a single shared origin:
         footprint_ll = [[float(p[0]), float(p[1])] for p in ring]
         footprint_xy = [[p[0] - origin_x, p[1] - origin_y] for p in footprint_ll]
 
@@ -160,9 +151,9 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> D
                 "zoning": zoning,
                 "assessed_value": assessed_value,
                 "address": address,
-                "footprint_ll": footprint_ll,  # raw projected coords
-                "footprint_xy": footprint_xy,  # centered for Three.js
-                "properties": props,           # popup always has data
+                "footprint_ll": footprint_ll,
+                "footprint_xy": footprint_xy,
+                "properties": props,
             }
         )
 
@@ -176,7 +167,7 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> D
         "bbox": bbox,
         "projection": {"coord_system": "projected_meters", "origin_x": origin_x, "origin_y": origin_y},
         "window_meters": win,
-        "area_m2": WINDOW_METERS * WINDOW_METERS,  # ✅ proof in response
+        "area_m2": WINDOW_METERS * WINDOW_METERS,
         "count": len(buildings),
         "buildings": buildings,
     }
