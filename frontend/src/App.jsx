@@ -514,13 +514,14 @@ export default function App() {
 
       {/* 3D View */}
       <div style={{ position: "relative" }}>
-        <ThreeMap
-          key={mapKey}
-          buildings={buildings}
-          matchedIds={matchedIds}
-          selectedBuildingId={selectedBuildingId}
-          onSelectBuilding={handleSelectBuilding}   {/* ✅ UPDATED */}
-        />
+       <ThreeMap
+  key={mapKey}
+  buildings={buildings}
+  matchedIds={matchedIds}
+  selectedBuildingId={selectedBuildingId}
+  onSelectBuilding={handleSelectBuilding}
+/>
+
       </div>
     </div>
   );
