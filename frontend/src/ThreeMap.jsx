@@ -11,8 +11,8 @@ function safeLabel(v) {
 // lon/lat degrees -> Web Mercator meters (EPSG:3857)
 function lonLatToMercatorMeters(lon, lat) {
   const R = 6378137;
-  const x = R * (lon * Math.PI / 180);
-  const y = R * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 360)));
+  const x = R * (lon * Math.PI) / 180;
+  const y = R * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
   return [x, y];
 }
 
@@ -26,9 +26,10 @@ export default function ThreeMap({ buildings, matchedIds }) {
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [selectedInfo, setSelectedInfo] = useState(null);
 
-  // tune these
-  const HEIGHT_SCALE = 1.0; // now that coords are meters, start at 1.0
-  const MIN_HEIGHT = 8; // meters
+  // ✅ Map-look tuning
+  // If buildings feel too flat, bump HEIGHT_SCALE up (2.2–3.0).
+  const HEIGHT_SCALE = 2.2;
+  const MIN_HEIGHT = 12;
 
   const mats = useMemo(() => {
     // Procedural "window" texture so extruded polygons read as actual buildings.
@@ -60,7 +61,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
 
       for (let y = padY; y < canvas.height - padY; y += winH + gapY) {
         for (let x = padX; x < canvas.width - padX; x += winW + gapX) {
-          // randomize lit windows
           const lit = Math.random() < 0.18;
           ctx.fillStyle = lit
             ? "rgba(255, 244, 214, 0.85)"
@@ -87,7 +87,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
 
     const facadeTex = makeFacadeTexture();
 
-    // Separate wall/roof materials for a more "real building" look.
+    // Wall + roof separation
     const wallBase = new THREE.MeshStandardMaterial({
       map: facadeTex || null,
       color: 0x9aa0a6,
@@ -96,13 +96,14 @@ export default function ThreeMap({ buildings, matchedIds }) {
       emissive: 0x000000,
       emissiveIntensity: 0.25,
     });
+
     const roofBase = new THREE.MeshStandardMaterial({
-      color: 0x6f747c,
+      color: 0x7c828a, // slightly brighter roof so it reads clearly
       roughness: 0.95,
       metalness: 0.02,
     });
 
-    // For match/selected: keep texture but tint + boost emissive so it reads as a highlight.
+    // Match tint
     const wallMatch = wallBase.clone();
     wallMatch.color = new THREE.Color(0xd93025);
     wallMatch.emissive = new THREE.Color(0x6b1a16);
@@ -111,6 +112,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
     const roofMatch = roofBase.clone();
     roofMatch.color = new THREE.Color(0xb3261e);
 
+    // Selected tint
     const wallSelected = wallBase.clone();
     wallSelected.color = new THREE.Color(0x1a73e8);
     wallSelected.emissive = new THREE.Color(0x0b2a66);
@@ -120,19 +122,20 @@ export default function ThreeMap({ buildings, matchedIds }) {
     roofSelected.color = new THREE.Color(0x1558b0);
 
     return {
-      // ExtrudeGeometry makes 3 groups (front/back/sides). Use material arrays so roofs differ from walls.
+      // ExtrudeGeometry groups: [front, back, sides]
+      // front/back = caps (roof surfaces), sides = walls
       base: [roofBase, roofBase, wallBase],
       match: [roofMatch, roofMatch, wallMatch],
       selected: [roofSelected, roofSelected, wallSelected],
       ground: new THREE.MeshStandardMaterial({
-        color: 0xf3f3f3,
+        color: 0xf2f2f2,
         roughness: 1.0,
         metalness: 0.0,
       }),
       edge: new THREE.LineBasicMaterial({
         color: 0x000000,
         transparent: true,
-        opacity: 0.16,
+        opacity: 0.12,
       }),
     };
   }, []);
@@ -146,7 +149,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
     if (pts.length >= 2) {
       const a = pts[0];
       const b = pts[pts.length - 1];
-      if (a.distanceTo(b) < 0.01) pts = pts.slice(0, -1); // meters now, so 0.01m is safe
+      if (a.distanceTo(b) < 0.01) pts = pts.slice(0, -1);
     }
     if (pts.length < 3) return null;
 
@@ -202,7 +205,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
     mountRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // lights (more directional, less flat)
+    // lights
     scene.add(new THREE.AmbientLight(0xffffff, 0.35));
 
     const sun = new THREE.DirectionalLight(0xffffff, 1.0);
@@ -211,14 +214,13 @@ export default function ThreeMap({ buildings, matchedIds }) {
     sun.shadow.mapSize.width = 2048;
     sun.shadow.mapSize.height = 2048;
     sun.shadow.camera.near = 1;
-    sun.shadow.camera.far = 8000;
-    sun.shadow.camera.left = -3000;
-    sun.shadow.camera.right = 3000;
-    sun.shadow.camera.top = 3000;
-    sun.shadow.camera.bottom = -3000;
+    sun.shadow.camera.far = 9000;
+    sun.shadow.camera.left = -4000;
+    sun.shadow.camera.right = 4000;
+    sun.shadow.camera.top = 4000;
+    sun.shadow.camera.bottom = -4000;
     scene.add(sun);
 
-    // subtle fill to avoid harsh contrast
     const fill = new THREE.DirectionalLight(0xffffff, 0.25);
     fill.position.set(-900, 1200, 900);
     scene.add(fill);
@@ -228,9 +230,9 @@ export default function ThreeMap({ buildings, matchedIds }) {
     controls.enableDamping = true;
     controls.dampingFactor = 0.07;
     controls.screenSpacePanning = false;
-    controls.maxPolarAngle = Math.PI / 2.05; // don’t go under ground
+    controls.maxPolarAngle = Math.PI / 2.05;
     controls.minDistance = 80;
-    controls.maxDistance = 12000;
+    controls.maxDistance = 14000;
 
     const group = new THREE.Group();
     scene.add(group);
@@ -249,7 +251,7 @@ export default function ThreeMap({ buildings, matchedIds }) {
 
     // Build meshes
     buildings.forEach((b) => {
-      const ll = b.footprint_ll; // ✅ use lon/lat from API
+      const ll = b.footprint_ll;
       if (!Array.isArray(ll) || ll.length < 3) return;
 
       const ptsMeters = ll.map(([lon, lat]) => {
@@ -273,6 +275,9 @@ export default function ThreeMap({ buildings, matchedIds }) {
 
       const mesh = new THREE.Mesh(geo, mats.base);
       mesh.userData = { building: b };
+
+      // ✅ Make it read like a city: shadows + sit on ground
+      mesh.position.z = 0;
       mesh.castShadow = true;
       mesh.receiveShadow = true;
 
@@ -292,7 +297,8 @@ export default function ThreeMap({ buildings, matchedIds }) {
     box.getSize(size);
     box.getCenter(center);
 
-    const groundSize = Math.max(size.x, size.y) * 1.6 || 2500;
+    // ✅ Bigger ground so it feels like a "map"
+    const groundSize = Math.max(size.x, size.y) * 1.8 || 3000;
 
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(groundSize, groundSize),
@@ -303,32 +309,31 @@ export default function ThreeMap({ buildings, matchedIds }) {
     ground.receiveShadow = true;
     scene.add(ground);
 
-    // ✅ FIX: only ONE grid, and it’s sized/positioned to the dataset
-    const gridHelper = new THREE.GridHelper(groundSize, 80, 0x000000, 0x000000);
+    // ✅ Single subtle grid (data-sized)
+    const gridHelper = new THREE.GridHelper(groundSize, 100, 0x000000, 0x000000);
     gridHelper.position.set(center.x, center.y, 0.01);
 
-    // GridHelper material may be a single material or an array
     if (Array.isArray(gridHelper.material)) {
       gridHelper.material.forEach((m) => {
         m.transparent = true;
-        m.opacity = 0.06;
+        m.opacity = 0.05;
       });
     } else {
       gridHelper.material.transparent = true;
-      gridHelper.material.opacity = 0.06;
+      gridHelper.material.opacity = 0.05;
     }
     scene.add(gridHelper);
 
-    // Fit camera
+    // Fit camera (more “map-like” tilted angle)
     const maxDim = Math.max(size.x, size.y, size.z) || 400;
     controls.target.copy(center);
 
     camera.near = 0.1;
-    camera.far = maxDim * 40 + 10000;
+    camera.far = maxDim * 50 + 12000;
     camera.position.set(
-      center.x + maxDim * 0.9,
-      center.y - maxDim * 1.4,
-      center.z + maxDim * 0.8
+      center.x + maxDim * 1.2,
+      center.y - maxDim * 1.6,
+      center.z + maxDim * 1.1
     );
     camera.updateProjectionMatrix();
 
@@ -412,8 +417,6 @@ export default function ThreeMap({ buildings, matchedIds }) {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", handleResize);
       renderer.domElement.removeEventListener("click", handleClick);
-
-      // optional: remove renderer canvas
       renderer.domElement?.remove();
       renderer.dispose();
     };
