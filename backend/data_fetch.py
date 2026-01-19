@@ -1,10 +1,10 @@
-"""Calgary Open Data fetch + normalization + joins (GeoJSON-first).
+"""
+Calgary Open Data fetch + normalization + joins (GeoJSON-first) 
 
-Meets requirements:
-- Pull building footprints + height from Calgary Open Data.
-- Restrict to ~5 blocks (WINDOW_METERS).
-- Join zoning (Land Use Districts) and assessed value (assessment parcels) via centroid point-in-polygon.
-- Return stable JSON for frontend (footprint_xy, height, zoning, assessed_value, etc.)
+Outputs stable JSON for frontend:
+- footprint_ll (lon/lat)
+- footprint_xy (local centered coords for Three.js)
+- height, zoning, assessed_value, address, properties...
 """
 
 from __future__ import annotations
@@ -16,15 +16,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from shapely.geometry import Point
 from shapely.geometry import shape as shp_shape
+from shapely.strtree import STRtree
 
 
 # --- Calgary Open Data endpoints (Socrata GeoJSON) ---
-BUILDINGS_URL = "https://data.calgary.ca/resource/cchr-krqg.geojson"  # 3D Buildings - Citywide
+BUILDINGS_URL = "https://data.calgary.ca/resource/cchr-krqg.geojson"  # 3D Buildings
 LAND_USE_URL = "https://data.calgary.ca/resource/qe6k-p9nh.geojson"   # Land Use Districts (zoning)
-ASSESS_URL = "https://data.calgary.ca/resource/4bsw-nn7w.geojson"     # Assessment parcels (assessed values)
+ASSESS_URL = "https://data.calgary.ca/resource/4bsw-nn7w.geojson"     # Assessment parcels
 
 
-# Keep env vars for compatibility
 DEFAULT_BBOX = {
     "south": float(os.getenv("BBOX_S", "51.046")),
     "west": float(os.getenv("BBOX_W", "-114.071")),
@@ -32,18 +32,20 @@ DEFAULT_BBOX = {
     "east": float(os.getenv("BBOX_E", "-114.065")),
 }
 
-FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "8000"))
+# How many buildings max to return to frontend
+RETURN_LIMIT = int(os.getenv("RETURN_LIMIT", "300"))
 
-# ✅ ~5 blocks window (projected meters)
-WINDOW_METERS = float(os.getenv("WINDOW_METERS", "450"))
+# How many features to fetch (already bbox-filtered, so these can be modest)
+BUILDINGS_FETCH_LIMIT = int(os.getenv("BUILDINGS_FETCH_LIMIT", "4000"))
+LAND_USE_FETCH_LIMIT = int(os.getenv("LAND_USE_FETCH_LIMIT", "12000"))
+ASSESS_FETCH_LIMIT = int(os.getenv("ASSESS_FETCH_LIMIT", "12000"))
 
-# These joins can be expensive; allow turning them off if needed
+# Joins toggles (safe for slow hosting)
 ENABLE_ZONING_JOIN = os.getenv("ENABLE_ZONING_JOIN", "1") == "1"
 ENABLE_ASSESS_JOIN = os.getenv("ENABLE_ASSESS_JOIN", "1") == "1"
 
-# Cap the number of zoning/assessment features loaded (safety)
-LAND_USE_LIMIT = int(os.getenv("LAND_USE_LIMIT", "50000"))
-ASSESS_LIMIT = int(os.getenv("ASSESS_LIMIT", "50000"))
+# Network
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 
 
 def _as_float(v: Any) -> Optional[float]:
@@ -65,10 +67,7 @@ def _extract_ring_coords(geom: Dict[str, Any]) -> Optional[List[List[float]]]:
         return None
 
     if gtype == "Polygon":
-        try:
-            return coords[0]
-        except Exception:
-            return None
+        return coords[0] if coords and coords[0] else None
 
     if gtype == "MultiPolygon":
         try:
@@ -79,106 +78,97 @@ def _extract_ring_coords(geom: Dict[str, Any]) -> Optional[List[List[float]]]:
     return None
 
 
-def _bbox_of_ring(ring: List[List[float]]) -> Tuple[float, float, float, float]:
-    xs = [float(p[0]) for p in ring]
-    ys = [float(p[1]) for p in ring]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def _intersects_window(ring: List[List[float]], win: Dict[str, float]) -> bool:
-    minx, miny, maxx, maxy = _bbox_of_ring(ring)
-    return not (
-        maxx < win["min_x"]
-        or minx > win["max_x"]
-        or maxy < win["min_y"]
-        or miny > win["max_y"]
+def _within_box_where(bbox: Dict[str, float]) -> str:
+    # within_box(geometry, north, west, south, east)
+    return (
+        f"within_box(geometry,{bbox['north']},{bbox['west']},"
+        f"{bbox['south']},{bbox['east']})"
     )
 
 
-def _fetch_geojson_features(url: str, limit: int) -> List[Dict[str, Any]]:
-    r = requests.get(url, params={"$limit": limit}, timeout=120)
+def _fetch_geojson_features(url: str, limit: int, where: Optional[str] = None) -> List[Dict[str, Any]]:
+    params = {"$limit": limit}
+    if where:
+        params["$where"] = where
+
+    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     gj = r.json()
+
     feats = gj.get("features")
     if not isinstance(feats, list):
         raise RuntimeError(f"GeoJSON response from {url} missing 'features'.")
     return feats
 
 
-def _choose_projected_window(building_features: List[Dict[str, Any]]) -> Dict[str, float]:
-    """Pick a seed building with valid polygon, then define a WINDOW_METERS square around it."""
-    half = WINDOW_METERS / 2.0
-    for f in building_features:
-        geom = f.get("geometry") or {}
-        ring = _extract_ring_coords(geom)
-        if ring and len(ring) >= 3:
-            x0, y0 = float(ring[0][0]), float(ring[0][1])
-            return {
-                "min_x": x0 - half,
-                "max_x": x0 + half,
-                "min_y": y0 - half,
-                "max_y": y0 + half,
-            }
-    raise RuntimeError("No valid building polygon geometries found.")
+def _bbox_center(bbox: Dict[str, float]) -> Tuple[float, float]:
+    # Use bbox center as origin for local XY
+    origin_x = (bbox["west"] + bbox["east"]) / 2.0
+    origin_y = (bbox["south"] + bbox["north"]) / 2.0
+    return origin_x, origin_y
 
 
-def _feature_bbox_xy(feat: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
-    geom = feat.get("geometry")
-    if not geom:
-        return None
-    ring = _extract_ring_coords(geom)
-    if not ring or len(ring) < 3:
-        return None
-    return _bbox_of_ring(ring)
+# -------- Spatial index loaders (bbox-filtered) --------
 
+@lru_cache(maxsize=8)
+def _load_land_use_index(north: float, west: float, south: float, east: float):
+    bbox = {"north": north, "west": west, "south": south, "east": east}
+    feats = _fetch_geojson_features(LAND_USE_URL, LAND_USE_FETCH_LIMIT, where=_within_box_where(bbox))
 
-def _bbox_overlap(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> bool:
-    aminx, aminy, amaxx, amaxy = a
-    bminx, bminy, bmaxx, bmaxy = b
-    return not (amaxx < bminx or aminx > bmaxx or amaxy < bminy or aminy > bmaxy)
-
-
-@lru_cache(maxsize=1)
-def _load_land_use() -> List[Dict[str, Any]]:
-    feats = _fetch_geojson_features(LAND_USE_URL, LAND_USE_LIMIT)
-    # Precompute bbox for speed
-    out = []
+    geoms = []
+    props_list = []
     for f in feats:
-        bb = _feature_bbox_xy(f)
-        if bb:
-            f["_bbox"] = bb
-            out.append(f)
-    return out
-
-
-@lru_cache(maxsize=1)
-def _load_assess() -> List[Dict[str, Any]]:
-    feats = _fetch_geojson_features(ASSESS_URL, ASSESS_LIMIT)
-    out = []
-    for f in feats:
-        bb = _feature_bbox_xy(f)
-        if bb:
-            f["_bbox"] = bb
-            out.append(f)
-    return out
-
-
-def _zoning_for_point(x: float, y: float, win_bbox: Tuple[float, float, float, float]) -> Optional[str]:
-    """Return zoning code for a point using Land Use polygons."""
-    p = Point(x, y)
-    for f in _load_land_use():
-        bb = f.get("_bbox")
-        if not bb or not _bbox_overlap(bb, win_bbox):
-            continue
-
         geom = f.get("geometry")
-        props = f.get("properties") or {}
         if not geom:
             continue
+        try:
+            g = shp_shape(geom)
+            if g.is_empty:
+                continue
+            geoms.append(g)
+            props_list.append(f.get("properties") or {})
+        except Exception:
+            continue
 
-        poly = shp_shape(geom)
+    tree = STRtree(geoms) if geoms else None
+    return tree, geoms, props_list
+
+
+@lru_cache(maxsize=8)
+def _load_assess_index(north: float, west: float, south: float, east: float):
+    bbox = {"north": north, "west": west, "south": south, "east": east}
+    feats = _fetch_geojson_features(ASSESS_URL, ASSESS_FETCH_LIMIT, where=_within_box_where(bbox))
+
+    geoms = []
+    props_list = []
+    for f in feats:
+        geom = f.get("geometry")
+        if not geom:
+            continue
+        try:
+            g = shp_shape(geom)
+            if g.is_empty:
+                continue
+            geoms.append(g)
+            props_list.append(f.get("properties") or {})
+        except Exception:
+            continue
+
+    tree = STRtree(geoms) if geoms else None
+    return tree, geoms, props_list
+
+
+def _zoning_for_point(p: Point, bbox: Dict[str, float]) -> Optional[str]:
+    tree, geoms, props_list = _load_land_use_index(bbox["north"], bbox["west"], bbox["south"], bbox["east"])
+    if not tree:
+        return None
+
+    # query candidates quickly
+    candidates = tree.query(p)
+    for poly in candidates:
         if poly.contains(p):
-            # Try common field names (dataset may vary)
+            i = geoms.index(poly)  # small list after bbox filter; OK
+            props = props_list[i]
             return (
                 props.get("land_use_district")
                 or props.get("district")
@@ -189,21 +179,16 @@ def _zoning_for_point(x: float, y: float, win_bbox: Tuple[float, float, float, f
     return None
 
 
-def _assessed_value_for_point(x: float, y: float, win_bbox: Tuple[float, float, float, float]) -> Optional[float]:
-    """Return assessed value for a point using assessment parcels."""
-    p = Point(x, y)
-    for f in _load_assess():
-        bb = f.get("_bbox")
-        if not bb or not _bbox_overlap(bb, win_bbox):
-            continue
+def _assessed_value_for_point(p: Point, bbox: Dict[str, float]) -> Optional[float]:
+    tree, geoms, props_list = _load_assess_index(bbox["north"], bbox["west"], bbox["south"], bbox["east"])
+    if not tree:
+        return None
 
-        geom = f.get("geometry")
-        props = f.get("properties") or {}
-        if not geom:
-            continue
-
-        poly = shp_shape(geom)
+    candidates = tree.query(p)
+    for poly in candidates:
         if poly.contains(p):
+            i = geoms.index(poly)
+            props = props_list[i]
             return (
                 _as_float(props.get("assessed_value"))
                 or _as_float(props.get("assessment"))
@@ -213,16 +198,16 @@ def _assessed_value_for_point(x: float, y: float, win_bbox: Tuple[float, float, 
     return None
 
 
-def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> Dict[str, Any]:
+# -------- Main API function --------
+
+def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int | None = None) -> Dict[str, Any]:
     bbox = bbox or DEFAULT_BBOX
+    limit = int(limit or RETURN_LIMIT)
 
-    building_features = _fetch_geojson_features(BUILDINGS_URL, FETCH_LIMIT)
+    where = _within_box_where(bbox)
+    building_features = _fetch_geojson_features(BUILDINGS_URL, BUILDINGS_FETCH_LIMIT, where=where)
 
-    # Choose a contiguous ~5-block window in projected meters
-    win = _choose_projected_window(building_features)
-    origin_x = (win["min_x"] + win["max_x"]) / 2.0
-    origin_y = (win["min_y"] + win["max_y"]) / 2.0
-    win_bbox = (win["min_x"], win["min_y"], win["max_x"], win["max_y"])
+    origin_x, origin_y = _bbox_center(bbox)
 
     buildings: List[Dict[str, Any]] = []
 
@@ -234,18 +219,20 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> D
         if not ring or len(ring) < 3:
             continue
 
-        if not _intersects_window(ring, win):
-            continue
-
-        # Footprint (projected coords)
+        # Footprint lon/lat
         footprint_ll = [[float(p[0]), float(p[1])] for p in ring]
 
-        # Centroid (simple average is OK for small polygons; fast)
-        xs = [p[0] for p in footprint_ll]
-        ys = [p[1] for p in footprint_ll]
-        cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+        # Better centroid (Shapely)
+        try:
+            poly = shp_shape(geom)
+            c = poly.centroid
+            p_centroid = Point(c.x, c.y)
+        except Exception:
+            xs = [p[0] for p in footprint_ll]
+            ys = [p[1] for p in footprint_ll]
+            p_centroid = Point(sum(xs) / len(xs), sum(ys) / len(ys))
 
-        # Height
+        # Height (fallback to 10)
         height = (
             _as_float(props.get("height"))
             or _as_float(props.get("bldg_height"))
@@ -254,7 +241,6 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> D
             or 10.0
         )
 
-        # Base fields (may be missing in building dataset)
         zoning = props.get("zoning") or props.get("land_use") or props.get("zone")
         address = props.get("address") or props.get("street_address") or props.get("full_address")
         assessed_value = (
@@ -263,14 +249,14 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> D
             or _as_float(props.get("value"))
         )
 
-        # ✅ Join zoning + assessed value using real Calgary datasets
+        # Joins (fast via STRtree)
         if ENABLE_ZONING_JOIN:
-            zoning = _zoning_for_point(cx, cy, win_bbox) or zoning
+            zoning = _zoning_for_point(p_centroid, bbox) or zoning
 
         if ENABLE_ASSESS_JOIN:
-            assessed_value = _assessed_value_for_point(cx, cy, win_bbox) or assessed_value
+            assessed_value = _assessed_value_for_point(p_centroid, bbox) or assessed_value
 
-        # Centered coords for Three.js
+        # Centered coords for Three.js (still degrees; if you want meters, you’d project in frontend or backend)
         footprint_xy = [[p[0] - origin_x, p[1] - origin_y] for p in footprint_ll]
 
         buildings.append(
@@ -280,9 +266,9 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> D
                 "zoning": zoning,
                 "assessed_value": assessed_value,
                 "address": address,
-                "footprint_ll": footprint_ll,   # raw projected coords
-                "footprint_xy": footprint_xy,   # centered for Three.js
-                "properties": props,            # raw record for popup
+                "footprint_ll": footprint_ll,
+                "footprint_xy": footprint_xy,
+                "properties": props,
             }
         )
 
@@ -290,13 +276,15 @@ def fetch_buildings(bbox: Dict[str, float] | None = None, limit: int = 200) -> D
             break
 
     if not buildings:
-        raise RuntimeError("0 buildings after filtering. Increase FETCH_LIMIT or WINDOW_METERS.")
+        raise RuntimeError("0 buildings returned for this bbox. Try a bigger bbox or check dataset availability.")
 
     return {
         "bbox": bbox,
-        "projection": {"coord_system": "projected_meters", "origin_x": origin_x, "origin_y": origin_y},
-        "window_meters": win,
-        "area_m2": WINDOW_METERS * WINDOW_METERS,
+        "projection": {
+            "coord_system": "EPSG:4326_lonlat_degrees",
+            "origin_x": origin_x,
+            "origin_y": origin_y,
+        },
         "count": len(buildings),
         "buildings": buildings,
     }
