@@ -8,7 +8,6 @@ function safeLabel(v) {
   return String(v);
 }
 
-// lon/lat degrees -> Web Mercator meters (EPSG:3857)
 function lonLatToMercatorMeters(lon, lat) {
   const R = 6378137;
   const x = (R * (lon * Math.PI)) / 180;
@@ -16,7 +15,6 @@ function lonLatToMercatorMeters(lon, lat) {
   return [x, y];
 }
 
-// Stable pseudo-random based on string (so colors don’t change every refresh)
 function hash01(str) {
   const s = String(str ?? "");
   let h = 2166136261;
@@ -91,8 +89,8 @@ function makePitchedRoof(footprintPts, height, roofMat) {
 export default function ThreeMap({
   buildings,
   matchedIds,
-  selectedBuildingId, // ✅ from App
-  onSelectBuilding, // ✅ callback to App
+  selectedBuildingId,
+  onSelectBuilding,
 }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
@@ -101,7 +99,6 @@ export default function ThreeMap({
   const cameraRef = useRef(null);
   const controlsRef = useRef(null);
 
-  const groupRef = useRef(null);
   const meshesRef = useRef([]); // building meshes only
   const centroidByIdRef = useRef(new Map()); // id -> {x,y,z}
 
@@ -199,7 +196,6 @@ export default function ThreeMap({
     return shape;
   }
 
-  // ✅ Apply materials based on matchedIds + selectedBuildingId
   function applyMaterials() {
     const selId = selectedBuildingId ?? null;
 
@@ -214,7 +210,6 @@ export default function ThreeMap({
     }
   }
 
-  // ✅ Focus camera on selected building when loading
   function focusOnBuildingId(bid) {
     if (!bid) return;
     const controls = controlsRef.current;
@@ -225,24 +220,16 @@ export default function ThreeMap({
     const target = new THREE.Vector3(cent.x, cent.y, 0);
     controls.target.copy(target);
 
-    // keep current direction, just move distance nicely
-    const currentDir = new THREE.Vector3()
-      .subVectors(camera.position, controls.target)
-      .normalize();
-    const dist = 900; // tweak if you want closer/farther
-
-    camera.position.set(
-      target.x + currentDir.x * dist,
-      target.y + currentDir.y * dist,
-      Math.max(220, cent.z + 420)
-    );
+    // go to a nice angle
+    const dist = 900;
+    camera.position.set(target.x + dist * 0.9, target.y - dist * 1.2, Math.max(260, cent.z + 420));
     camera.updateProjectionMatrix();
   }
 
   useEffect(() => {
     if (!mountRef.current) return;
 
-    // cleanup previous renderer
+    // cleanup
     if (rendererRef.current) {
       rendererRef.current.domElement?.remove();
       rendererRef.current.dispose();
@@ -311,10 +298,9 @@ export default function ThreeMap({
     controls.maxDistance = 22000;
 
     const group = new THREE.Group();
-    groupRef.current = group;
     scene.add(group);
 
-    // ----- origin -----
+    // origin
     let originMx = 0;
     let originMy = 0;
 
@@ -342,7 +328,7 @@ export default function ThreeMap({
 
       const baseH = Number(b.height) || 10;
       const r = hash01(b.id ?? b.address ?? JSON.stringify(ll).slice(0, 40));
-      const jitter = 0.9 + r * 0.7; // 0.9..1.6
+      const jitter = 0.9 + r * 0.7;
       const h = Math.max(MIN_HEIGHT, baseH * HEIGHT_SCALE * jitter);
 
       const hue = 0.55 + r * 0.12;
@@ -396,7 +382,7 @@ export default function ThreeMap({
       }
     });
 
-    // ---- Fit bounds ----
+    // fit bounds
     const box = new THREE.Box3().setFromObject(group);
     const size = new THREE.Vector3();
     const center = new THREE.Vector3();
@@ -405,6 +391,7 @@ export default function ThreeMap({
 
     const groundSize = Math.max(size.x, size.y) * 2.4 || 4500;
 
+    // platform
     const platformThickness = Math.max(20, groundSize * 0.005);
     const platform = new THREE.Mesh(
       new THREE.BoxGeometry(groundSize, groundSize, platformThickness),
@@ -414,15 +401,14 @@ export default function ThreeMap({
     platform.receiveShadow = true;
     scene.add(platform);
 
-    const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(groundSize, groundSize),
-      mats.ground
-    );
+    // ground
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), mats.ground);
     ground.rotation.x = -Math.PI / 2;
     ground.position.set(center.x, center.y, 0);
     ground.receiveShadow = true;
     scene.add(ground);
 
+    // grid
     const gridHelper = new THREE.GridHelper(groundSize, 120, 0x000000, 0x000000);
     gridHelper.position.set(center.x, center.y, 0.02);
     if (Array.isArray(gridHelper.material)) {
@@ -436,7 +422,7 @@ export default function ThreeMap({
     }
     scene.add(gridHelper);
 
-    // ✅ ROADS
+    // roads
     const roadsGroup = new THREE.Group();
     scene.add(roadsGroup);
 
@@ -445,20 +431,14 @@ export default function ThreeMap({
 
     for (let i = -3; i <= 3; i++) {
       const x = center.x + i * majorStep;
-      const roadV = new THREE.Mesh(
-        new THREE.PlaneGeometry(majorWidth, groundSize),
-        mats.majorRoad
-      );
+      const roadV = new THREE.Mesh(new THREE.PlaneGeometry(majorWidth, groundSize), mats.majorRoad);
       roadV.rotation.x = -Math.PI / 2;
       roadV.position.set(x, center.y, 0.03);
       roadV.receiveShadow = true;
       roadsGroup.add(roadV);
 
       const y = center.y + i * majorStep;
-      const roadH = new THREE.Mesh(
-        new THREE.PlaneGeometry(groundSize, majorWidth),
-        mats.majorRoad
-      );
+      const roadH = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, majorWidth), mats.majorRoad);
       roadH.rotation.x = -Math.PI / 2;
       roadH.position.set(center.x, y, 0.03);
       roadH.receiveShadow = true;
@@ -500,20 +480,16 @@ export default function ThreeMap({
       }
     }
 
-    // ✅ Camera
+    // camera
     const maxDim = Math.max(size.x, size.y, size.z) || 600;
     controls.target.copy(center);
 
     camera.near = 0.1;
     camera.far = maxDim * 80 + 20000;
-    camera.position.set(
-      center.x + maxDim * 1.6,
-      center.y - maxDim * 2.1,
-      center.z + maxDim * 1.25
-    );
+    camera.position.set(center.x + maxDim * 1.6, center.y - maxDim * 2.1, center.z + maxDim * 1.25);
     camera.updateProjectionMatrix();
 
-    // raycast click -> select building, tell App
+    // click
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
 
@@ -530,8 +506,8 @@ export default function ThreeMap({
         const bid = building?.id ?? null;
 
         if (bid !== null && bid !== undefined) {
-          onSelectBuilding?.(bid); // ✅ sends selection to App
-          applyMaterials(); // immediate visual update
+          onSelectBuilding?.(bid); // ✅ sends to App so it gets saved
+          applyMaterials();
           focusOnBuildingId(bid);
         }
 
@@ -549,6 +525,7 @@ export default function ThreeMap({
 
     renderer.domElement.addEventListener("click", handleClick);
 
+    // resize
     const handleResize = () => {
       if (!mountRef.current) return;
       const w = mountRef.current.clientWidth;
@@ -559,6 +536,7 @@ export default function ThreeMap({
     };
     window.addEventListener("resize", handleResize);
 
+    // loop
     let raf = 0;
     const animate = () => {
       raf = requestAnimationFrame(animate);
@@ -567,7 +545,7 @@ export default function ThreeMap({
     };
     animate();
 
-    // initial highlight apply + focus if selectedBuildingId exists
+    // initial paint + focus
     applyMaterials();
     if (selectedBuildingId) focusOnBuildingId(selectedBuildingId);
 
@@ -581,7 +559,7 @@ export default function ThreeMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [buildings, mats]);
 
-  // ✅ Re-apply visuals when matchedIds OR selectedBuildingId changes (no remount needed)
+  // update visuals when matched or selected changes
   useEffect(() => {
     applyMaterials();
     if (selectedBuildingId) focusOnBuildingId(selectedBuildingId);
