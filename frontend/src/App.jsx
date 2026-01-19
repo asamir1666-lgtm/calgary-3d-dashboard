@@ -22,15 +22,9 @@ function getProjectName(p) {
   return p.name || p.project_name || p.title || "";
 }
 
-// normalize ids into Numbers (fixes string/number mismatch)
+// ✅ IMPORTANT: treat IDs as STRINGS (some ids are "b0", etc.)
 function normalizeIdSet(arr) {
   return new Set((arr || []).map((x) => (x === null || x === undefined ? x : String(x))));
-}
-
-function normalizeIdArray(arr) {
-  return (arr || [])
-    .filter((x) => x !== null && x !== undefined)
-    .map((x) => Number(x));
 }
 
 export default function App() {
@@ -53,12 +47,11 @@ export default function App() {
 
   const [matchedIds, setMatchedIds] = useState(new Set());
 
-  // ✅ MULTI SELECT (Set of ids)
+  // ✅ MULTI SELECT (Set of string ids)
   const [selectedBuildingIds, setSelectedBuildingIds] = useState(new Set());
 
-  // ✅ keep single for backward compatibility (optional)
+  // optional single (last selected) for compatibility
   const selectedBuildingId = useMemo(() => {
-    // last selected id (for any parts still using single)
     const arr = Array.from(selectedBuildingIds);
     return arr.length ? arr[arr.length - 1] : null;
   }, [selectedBuildingIds]);
@@ -144,6 +137,8 @@ export default function App() {
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "Failed to apply filters");
+
+      // ✅ normalize to strings
       setMatchedIds(normalizeIdSet(j.matched_ids || []));
     } catch (e) {
       console.warn(e);
@@ -216,22 +211,21 @@ export default function App() {
 
   // ---------- MULTI-SELECT BUILDINGS ----------
   function toggleSelectBuilding(id) {
-  if (id === null || id === undefined) return;
+    if (id === null || id === undefined) return;
 
-  pushCurrentToHistory();
-  setActiveProjectName("");
+    pushCurrentToHistory();
+    setActiveProjectName("");
 
-  setSelectedBuildingIds((prev) => {
-    const next = new Set(prev);
-    const key = String(id);
-    if (next.has(key)) next.delete(key);
-    else next.add(key);
-    return next;
-  });
+    setSelectedBuildingIds((prev) => {
+      const next = new Set(prev);
+      const key = String(id);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
 
-  setMapKey((k) => k + 1);
-}
-
+    setMapKey((k) => k + 1);
+  }
 
   function clearSelectedBuildings() {
     pushCurrentToHistory();
@@ -248,7 +242,7 @@ export default function App() {
     if (!user) return setError("Enter a username first.");
     if (!name) return setError("Enter a project name.");
 
-    const selectedArr = Array.from(selectedBuildingIds || []);
+    const selectedArr = Array.from(selectedBuildingIds || []).map(String);
 
     if (!filters.length && selectedArr.length === 0) {
       return setError("Add filters or select buildings before saving.");
@@ -265,12 +259,15 @@ export default function App() {
           username: user,
           name,
           filters,
-          matched_ids: Array.from(matchedIds || []),
+          matched_ids: Array.from(matchedIds || []).map(String),
 
-        
-          selected_building_ids: Array.from(selectedBuildingIds || []).map(String),
-          selected_building_id: Array.from(selectedBuildingIds || []).map(String).slice(-1)[0] ?? null,
+          // ✅ multi-select selection saved
+          selected_building_ids: selectedArr,
 
+          // ✅ keep old field too (last selected)
+          selected_building_id: selectedArr.length ? selectedArr[selectedArr.length - 1] : null,
+        }),
+      });
 
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "Save failed");
@@ -307,15 +304,14 @@ export default function App() {
       if (!r.ok) throw new Error(j?.error || "Load failed");
 
       const loadedFilters = Array.isArray(j.filters) ? j.filters : [];
-
       setActiveProjectName(name);
 
-      // ✅ NEW: load multi-select if present, else fallback to single
+      // ✅ load multi-select if present, else fallback to single
       const loadedSelected =
         Array.isArray(j.selected_building_ids)
           ? normalizeIdSet(j.selected_building_ids)
           : j.selected_building_id !== null && j.selected_building_id !== undefined
-          ? new Set([Number(j.selected_building_id)])
+          ? new Set([String(j.selected_building_id)])
           : new Set();
 
       setSelectedBuildingIds(loadedSelected);
@@ -478,7 +474,7 @@ export default function App() {
 
         <h3 style={{ margin: "0 0 8px 0" }}>Selected Buildings</h3>
         {ui.selected === 0 ? (
-          <div style={{ fontSize: 13, color: "#777" }}>Click buildings on the map to select (multi-select).</div>
+          <div style={{ fontSize: 13, color: "#777" }}>Click buildings on the map to toggle selection.</div>
         ) : (
           <div style={{ display: "grid", gap: 8 }}>
             <div style={{ fontSize: 13, color: "#555" }}>
@@ -535,7 +531,6 @@ export default function App() {
               const savedFilters = Array.isArray(p?.filters) ? p.filters : null;
               const isActive = name === activeProjectName;
 
-              // show a hint if backend returns this in the list
               const selectedCount =
                 Array.isArray(p?.selected_building_ids)
                   ? p.selected_building_ids.length
@@ -586,9 +581,9 @@ export default function App() {
           key={mapKey}
           buildings={buildings}
           matchedIds={matchedIds}
-          selectedBuildingIds={selectedBuildingIds}   // ✅ NEW (multi-select)
-          selectedBuildingId={selectedBuildingId}     // optional compatibility
-          onSelectBuilding={toggleSelectBuilding}     // ✅ now toggles
+          selectedBuildingIds={selectedBuildingIds}
+          selectedBuildingId={selectedBuildingId}
+          onSelectBuilding={toggleSelectBuilding}
         />
       </div>
     </div>
